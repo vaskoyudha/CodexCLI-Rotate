@@ -1,0 +1,1443 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# codex-rotate
+# Account rotation manager for Codex CLI auth profiles.
+#
+# Design summary:
+# - Stores per-account credentials under ~/.codex-accounts/credentials/<alias>.json
+# - Maintains metadata in ~/.codex-accounts/state.json
+# - Uses atomic symlink swap for ~/.codex/auth.json (or $CODEX_HOME/auth.json)
+# - Supports round-robin switching, cooldowns, and automatic retries on rate limit
+
+###############################################################################
+# Global constants and derived paths
+###############################################################################
+
+SCRIPT_NAME="codex-rotate"
+SCRIPT_VERSION="1.0.0"
+
+HOME_DIR="${HOME:-/home/vascosera}"
+ACCOUNTS_DIR="${HOME_DIR}/.codex-accounts"
+CONFIG_FILE="${ACCOUNTS_DIR}/config.sh"
+STATE_FILE="${ACCOUNTS_DIR}/state.json"
+ORDER_FILE="${ACCOUNTS_DIR}/order"
+ACTIVE_FILE="${ACCOUNTS_DIR}/active"
+CREDENTIALS_DIR="${ACCOUNTS_DIR}/credentials"
+LOCK_DIR="${ACCOUNTS_DIR}/locks"
+LOCK_FILE="${LOCK_DIR}/state.lock"
+
+# Honor CODEX_HOME if explicitly set by user.
+if [[ -n "${CODEX_HOME:-}" ]]; then
+  CODEX_DIR="${CODEX_HOME}"
+  WARN_CODEX_HOME=1
+else
+  CODEX_DIR="${HOME_DIR}/.codex"
+  WARN_CODEX_HOME=0
+fi
+
+CODEX_AUTH="${CODEX_DIR}/auth.json"
+CODEX_AUTH_BACKUP="${CODEX_DIR}/auth.json.backup"
+CODEX_CONFIG="${CODEX_DIR}/config.toml"
+
+DEFAULT_CODEX_BIN="/home/vascosera/.config/nvm/versions/node/v22.22.2/bin/codex"
+
+# Default config values (overridden by ~/.codex-accounts/config.sh)
+ROTATION_INTERVAL=10800
+HOURLY_COOLDOWN=3600
+DAILY_COOLDOWN=86400
+WEEKLY_COOLDOWN=604800
+MAX_RETRIES=3
+CODEX_BIN=""
+
+###############################################################################
+# ANSI colors and output helpers
+###############################################################################
+
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+WHITE="\033[37m"
+BOLD="\033[1m"
+RESET="\033[0m"
+
+log_info() {
+  printf "%b[INFO]%b %s\n" "${BLUE}" "${RESET}" "$*"
+}
+
+log_warn() {
+  printf "%b[WARN]%b %s\n" "${YELLOW}" "${RESET}" "$*" >&2
+}
+
+log_error() {
+  printf "%b[ERROR]%b %s\n" "${RED}" "${RESET}" "$*" >&2
+}
+
+log_success() {
+  printf "%b[OK]%b %s\n" "${GREEN}" "${RESET}" "$*"
+}
+
+die() {
+  log_error "$*"
+  exit 1
+}
+
+###############################################################################
+# Validation and dependency checks
+###############################################################################
+
+check_prerequisites() {
+  command -v jq >/dev/null 2>&1 || die "jq is required but not installed"
+  command -v flock >/dev/null 2>&1 || die "flock is required but not installed"
+  command -v mktemp >/dev/null 2>&1 || die "mktemp is required but not installed"
+  command -v date >/dev/null 2>&1 || die "date is required but not installed"
+  command -v stat >/dev/null 2>&1 || die "stat is required but not installed"
+
+  if (( WARN_CODEX_HOME == 1 )); then
+    log_warn "CODEX_HOME is set to '${CODEX_HOME}'. Using that location for auth.json/config.toml."
+  fi
+}
+
+resolve_codex_bin() {
+  if [[ -n "${CODEX_BIN}" ]]; then
+    command -v "${CODEX_BIN}" >/dev/null 2>&1 || die "Configured CODEX_BIN not executable: ${CODEX_BIN}"
+    return
+  fi
+
+  if command -v codex >/dev/null 2>&1; then
+    CODEX_BIN="$(command -v codex)"
+    return
+  fi
+
+  if [[ -x "${DEFAULT_CODEX_BIN}" ]]; then
+    CODEX_BIN="${DEFAULT_CODEX_BIN}"
+    return
+  fi
+
+  die "Could not find codex binary. Set CODEX_BIN in ${CONFIG_FILE}."
+}
+
+validate_alias() {
+  local alias="$1"
+  [[ -n "${alias}" ]] || return 1
+  [[ "${alias}" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+  [[ "${alias}" != *"/"* ]] || return 1
+  [[ "${alias}" != *".."* ]] || return 1
+  return 0
+}
+
+require_initialized() {
+  [[ -d "${ACCOUNTS_DIR}" ]] || die "Not initialized. Run: ${SCRIPT_NAME} init"
+  [[ -f "${CONFIG_FILE}" ]] || die "Missing config file: ${CONFIG_FILE}. Run: ${SCRIPT_NAME} init"
+  [[ -f "${STATE_FILE}" ]] || die "Missing state file: ${STATE_FILE}. Run: ${SCRIPT_NAME} init"
+  [[ -f "${ORDER_FILE}" ]] || die "Missing order file: ${ORDER_FILE}. Run: ${SCRIPT_NAME} init"
+  [[ -f "${ACTIVE_FILE}" ]] || die "Missing active file: ${ACTIVE_FILE}. Run: ${SCRIPT_NAME} init"
+  [[ -d "${CREDENTIALS_DIR}" ]] || die "Missing credentials dir: ${CREDENTIALS_DIR}. Run: ${SCRIPT_NAME} init"
+  mkdir -p "${LOCK_DIR}"
+  touch "${LOCK_FILE}"
+}
+
+###############################################################################
+# Locking
+###############################################################################
+
+with_lock() { flock -x "${LOCK_FILE}" -c "$1"; }
+
+###############################################################################
+# Time helpers
+###############################################################################
+
+now_epoch() {
+  date +%s
+}
+
+now_iso() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+iso_to_epoch() {
+  local ts="$1"
+  if [[ -z "${ts}" ]]; then
+    printf "0"
+    return 0
+  fi
+  if ! date -u -d "${ts}" +%s >/dev/null 2>&1; then
+    printf "0"
+    return 0
+  fi
+  date -u -d "${ts}" +%s
+}
+
+format_duration() {
+  local total="${1:-0}"
+  if [[ -z "${total}" || "${total}" -le 0 ]]; then
+    printf "0s"
+    return 0
+  fi
+
+  local days hours mins secs
+  days=$(( total / 86400 ))
+  hours=$(( (total % 86400) / 3600 ))
+  mins=$(( (total % 3600) / 60 ))
+  secs=$(( total % 60 ))
+
+  if (( days > 0 )); then
+    if (( hours > 0 )); then
+      printf "%dd %dh" "${days}" "${hours}"
+    else
+      printf "%dd" "${days}"
+    fi
+    return 0
+  fi
+
+  if (( hours > 0 )); then
+    if (( mins > 0 )); then
+      printf "%dh %dm" "${hours}" "${mins}"
+    else
+      printf "%dh" "${hours}"
+    fi
+    return 0
+  fi
+
+  if (( mins > 0 )); then
+    printf "%dm" "${mins}"
+    return 0
+  fi
+
+  printf "%ds" "${secs}"
+}
+
+format_time_ago() {
+  local epoch="${1:-0}"
+  if [[ -z "${epoch}" || "${epoch}" -le 0 ]]; then
+    printf "never"
+    return 0
+  fi
+
+  local now diff
+  now="$(now_epoch)"
+  diff=$(( now - epoch ))
+  if (( diff < 0 )); then
+    printf "just now"
+    return 0
+  fi
+
+  if (( diff < 60 )); then
+    printf "%ss ago" "${diff}"
+    return 0
+  fi
+  if (( diff < 3600 )); then
+    printf "%sm ago" "$(( diff / 60 ))"
+    return 0
+  fi
+  if (( diff < 86400 )); then
+    printf "%sh ago" "$(( diff / 3600 ))"
+    return 0
+  fi
+  printf "%sd ago" "$(( diff / 86400 ))"
+}
+
+###############################################################################
+# Config loading
+###############################################################################
+
+load_config() {
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CONFIG_FILE}"
+  fi
+  resolve_codex_bin
+}
+
+write_default_config() {
+  local tmp
+  tmp="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")"
+  cat > "${tmp}" <<'EOF'
+# codex-rotate configuration
+# Edit and re-run to apply changes
+
+ROTATION_INTERVAL=10800        # Time-based rotation interval (seconds) — 3 hours
+HOURLY_COOLDOWN=3600           # Cooldown for hourly rate limit (1 hour)
+DAILY_COOLDOWN=86400           # Cooldown for daily rate limit (24 hours)
+WEEKLY_COOLDOWN=604800         # Cooldown for weekly rate limit (7 days)
+MAX_RETRIES=3                  # Max retries after rate limit before giving up
+CODEX_BIN=""                   # Override codex binary path (auto-detected if empty)
+EOF
+  mv -f "${tmp}" "${CONFIG_FILE}"
+}
+
+###############################################################################
+# State management (jq + atomic writes)
+###############################################################################
+
+read_state() {
+  [[ -f "${STATE_FILE}" ]] || die "Missing state file: ${STATE_FILE}"
+  jq '.' "${STATE_FILE}"
+}
+
+write_state() {
+  local filter="$1"
+  shift
+  local tmp
+  tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")"
+
+  if ! jq "$@" "${filter}" "${STATE_FILE}" > "${tmp}"; then
+    rm -f "${tmp}"
+    die "Failed updating state with jq filter: ${filter}"
+  fi
+
+  mv -f "${tmp}" "${STATE_FILE}"
+}
+
+get_account_state() {
+  local alias="$1"
+  local field="$2"
+  jq -r --arg alias "${alias}" --arg field "${field}" '.accounts[$alias][$field] // empty' "${STATE_FILE}"
+}
+
+set_account_state() {
+  local alias="$1"
+  local field="$2"
+  local value="$3"
+
+  if [[ "${value}" =~ ^-?[0-9]+$ ]]; then
+    write_state '.accounts[$alias][$field] = $value' \
+      --arg alias "${alias}" \
+      --arg field "${field}" \
+      --argjson value "${value}"
+  else
+    write_state '.accounts[$alias][$field] = $value' \
+      --arg alias "${alias}" \
+      --arg field "${field}" \
+      --arg value "${value}"
+  fi
+}
+
+init_account_state_entry() {
+  local alias="$1"
+  write_state '.accounts[$alias] = {
+      "cooldown_until": 0,
+      "total_uses": 0,
+      "last_used": "",
+      "rate_limit_hits": 0,
+      "last_rate_limit": ""
+    }' --arg alias "${alias}"
+}
+
+delete_account_state_entry() {
+  local alias="$1"
+  write_state 'del(.accounts[$alias])' --arg alias "${alias}"
+}
+
+###############################################################################
+# Account/order helpers
+###############################################################################
+
+get_active() {
+  [[ -f "${ACTIVE_FILE}" ]] || {
+    printf ""
+    return 0
+  }
+  local active
+  IFS= read -r active < "${ACTIVE_FILE}" || true
+  printf "%s" "${active:-}"
+}
+
+set_active() {
+  local alias="$1"
+  local tmp
+  tmp="$(mktemp "${ACTIVE_FILE}.tmp.XXXXXX")"
+  printf "%s\n" "${alias}" > "${tmp}"
+  mv -f "${tmp}" "${ACTIVE_FILE}"
+}
+
+get_order() {
+  [[ -f "${ORDER_FILE}" ]] || return 0
+  local line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" ]] && continue
+    printf "%s\n" "${line}"
+  done < "${ORDER_FILE}"
+}
+
+append_order() {
+  local alias="$1"
+  local exists=0
+  local line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" == "${alias}" ]]; then
+      exists=1
+      break
+    fi
+  done < "${ORDER_FILE}"
+
+  if (( exists == 0 )); then
+    printf "%s\n" "${alias}" >> "${ORDER_FILE}"
+  fi
+}
+
+remove_from_order() {
+  local alias="$1"
+  local tmp
+  tmp="$(mktemp "${ORDER_FILE}.tmp.XXXXXX")"
+  local line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" ]] && continue
+    [[ "${line}" == "${alias}" ]] && continue
+    printf "%s\n" "${line}" >> "${tmp}"
+  done < "${ORDER_FILE}"
+  mv -f "${tmp}" "${ORDER_FILE}"
+}
+
+account_exists() {
+  local alias="$1"
+  [[ -f "${CREDENTIALS_DIR}/${alias}.json" ]]
+}
+
+is_on_cooldown() {
+  local alias="$1"
+  local now cooldown_until
+  now="$(now_epoch)"
+  cooldown_until="$(get_account_state "${alias}" "cooldown_until")"
+  cooldown_until="${cooldown_until:-0}"
+  [[ "${cooldown_until}" =~ ^[0-9]+$ ]] || cooldown_until=0
+  (( cooldown_until > now ))
+}
+
+cooldown_remaining() {
+  local alias="$1"
+  local now cooldown_until
+  now="$(now_epoch)"
+  cooldown_until="$(get_account_state "${alias}" "cooldown_until")"
+  cooldown_until="${cooldown_until:-0}"
+  [[ "${cooldown_until}" =~ ^[0-9]+$ ]] || cooldown_until=0
+
+  if (( cooldown_until > now )); then
+    printf "%s" "$(( cooldown_until - now ))"
+  else
+    printf "0"
+  fi
+}
+
+get_next_available() {
+  mapfile -t all_aliases < <(get_order)
+  local total="${#all_aliases[@]}"
+  (( total > 0 )) || {
+    printf ""
+    return 0
+  }
+
+  local active start_idx i idx alias
+  active="$(get_active)"
+  start_idx=0
+
+  if [[ -n "${active}" ]]; then
+    for i in "${!all_aliases[@]}"; do
+      if [[ "${all_aliases[$i]}" == "${active}" ]]; then
+        start_idx=$(( (i + 1) % total ))
+        break
+      fi
+    done
+  fi
+
+  for (( i=0; i<total; i++ )); do
+    idx=$(( (start_idx + i) % total ))
+    alias="${all_aliases[$idx]}"
+    [[ -f "${CREDENTIALS_DIR}/${alias}.json" ]] || continue
+    if ! is_on_cooldown "${alias}"; then
+      printf "%s" "${alias}"
+      return 0
+    fi
+  done
+
+  printf ""
+}
+
+get_next_with_fallback() {
+  # Best effort helper: returns next available; if all cooldown, returns next with creds.
+  local next
+  next="$(get_next_available)"
+  if [[ -n "${next}" ]]; then
+    printf "%s" "${next}"
+    return 0
+  fi
+
+  mapfile -t all_aliases < <(get_order)
+  local alias
+  for alias in "${all_aliases[@]}"; do
+    [[ -f "${CREDENTIALS_DIR}/${alias}.json" ]] || continue
+    printf "%s" "${alias}"
+    return 0
+  done
+  printf ""
+}
+
+###############################################################################
+# Symlink management
+###############################################################################
+
+backup_original_auth_if_needed() {
+  mkdir -p "${CODEX_DIR}"
+  if [[ -L "${CODEX_AUTH}" ]]; then
+    return 0
+  fi
+  if [[ -f "${CODEX_AUTH}" && ! -f "${CODEX_AUTH_BACKUP}" ]]; then
+    cp -a "${CODEX_AUTH}" "${CODEX_AUTH_BACKUP}"
+    log_info "Backed up original auth.json to ${CODEX_AUTH_BACKUP}"
+  fi
+}
+
+ensure_symlink() {
+  local alias="$1"
+  local target="${CREDENTIALS_DIR}/${alias}.json"
+  [[ -r "${target}" ]] || die "Credential target not readable: ${target}"
+
+  mkdir -p "${CODEX_DIR}"
+  local tmp_link
+  tmp_link="${CODEX_AUTH}.tmp.$$"
+
+  ln -sf "${target}" "${tmp_link}"
+  mv -f "${tmp_link}" "${CODEX_AUTH}"
+}
+
+validate_symlink() {
+  [[ -L "${CODEX_AUTH}" ]] || return 1
+  local target
+  target="$(readlink "${CODEX_AUTH}" || true)"
+  [[ -n "${target}" ]] || return 1
+  [[ -r "${target}" ]]
+}
+
+###############################################################################
+# Rate-limit detection and cooldown classification
+###############################################################################
+
+rate_limit_regex() {
+  printf '%s' 'usageLimitExceeded|responseTooManyFailedAttempts|429|rate[[:space:]-]*limit|too[[:space:]]+many[[:space:]]+requests|usage[[:space:]]+cap|account/rateLimits/updated|you'
+  printf "'"
+  printf '%s' 've[[:space:]]+reached|capacity|try[[:space:]]+again[[:space:]]+later|limit[[:space:]]+exceeded'
+}
+
+detect_rate_limit() {
+  local file="$1"
+  [[ -f "${file}" ]] || return 1
+  local regex
+  regex="$(rate_limit_regex)"
+  jq -Rsr --arg re "${regex}" 'test($re; "i")' "${file}" | jq -e '. == true' >/dev/null 2>&1
+}
+
+classify_cooldown() {
+  local file="$1"
+  [[ -f "${file}" ]] || {
+    printf "%s" "${HOURLY_COOLDOWN}"
+    return 0
+  }
+
+  local text
+  text="$(jq -Rsr '.' "${file}" | tr '[:upper:]' '[:lower:]')"
+
+  # Heuristics: prefer strongest/longest phrases first.
+  if [[ "${text}" == *"weekly"* || "${text}" == *"7 day"* || "${text}" == *"7-day"* || "${text}" == *"week"* ]]; then
+    printf "%s" "${WEEKLY_COOLDOWN}"
+    return 0
+  fi
+
+  if [[ "${text}" == *"daily"* || "${text}" == *"24 hour"* || "${text}" == *"24-hour"* || "${text}" == *"day"* || "${text}" == *"tomorrow"* ]]; then
+    printf "%s" "${DAILY_COOLDOWN}"
+    return 0
+  fi
+
+  if [[ "${text}" == *"hour"* || "${text}" == *"60 minute"* || "${text}" == *"1h"* ]]; then
+    printf "%s" "${HOURLY_COOLDOWN}"
+    return 0
+  fi
+
+  # If numeric hour appears (e.g., "try again in 2 hours")
+  local guessed_hours
+  guessed_hours="$(jq -Rsr 'capture("(?<n>[0-9]+)\\s*hours?")?.n // empty' "${file}" 2>/dev/null || true)"
+  if [[ -n "${guessed_hours}" && "${guessed_hours}" =~ ^[0-9]+$ ]]; then
+    printf "%s" "$(( guessed_hours * 3600 ))"
+    return 0
+  fi
+
+  printf "%s" "${HOURLY_COOLDOWN}"
+}
+
+mark_rate_limit_hit() {
+  local alias="$1"
+  local cooldown_secs="$2"
+  local until now_iso_ts current_hits
+  until=$(( $(now_epoch) + cooldown_secs ))
+  now_iso_ts="$(now_iso)"
+  current_hits="$(get_account_state "${alias}" "rate_limit_hits")"
+  current_hits="${current_hits:-0}"
+  [[ "${current_hits}" =~ ^[0-9]+$ ]] || current_hits=0
+
+  set_account_state "${alias}" "cooldown_until" "${until}"
+  set_account_state "${alias}" "rate_limit_hits" "$(( current_hits + 1 ))"
+  set_account_state "${alias}" "last_rate_limit" "${now_iso_ts}"
+}
+
+###############################################################################
+# JWT parsing helpers
+###############################################################################
+
+decode_base64url() {
+  local input="$1"
+  local rem
+  rem=$(( ${#input} % 4 ))
+  if (( rem == 2 )); then
+    input+="=="
+  elif (( rem == 3 )); then
+    input+="="
+  elif (( rem == 1 )); then
+    # invalid base64url length
+    printf ""
+    return 1
+  fi
+  printf "%s" "${input}" | tr '_-' '/+' | base64 -d 2>/dev/null || true
+}
+
+extract_email_from_id_token() {
+  local token="$1"
+  [[ -n "${token}" ]] || {
+    printf ""
+    return 0
+  }
+
+  local payload_b64 payload_json
+  payload_b64="${token#*.}"
+  payload_b64="${payload_b64%%.*}"
+  payload_json="$(decode_base64url "${payload_b64}")"
+  [[ -n "${payload_json}" ]] || {
+    printf ""
+    return 0
+  }
+
+  printf "%s" "${payload_json}" | jq -r '.email // empty' 2>/dev/null || true
+}
+
+###############################################################################
+# Bootstrap/init helpers
+###############################################################################
+
+ensure_account_dirs() {
+  mkdir -p "${ACCOUNTS_DIR}" "${CREDENTIALS_DIR}" "${LOCK_DIR}"
+  chmod 700 "${ACCOUNTS_DIR}" "${CREDENTIALS_DIR}"
+  touch "${LOCK_FILE}"
+}
+
+initialize_state_files() {
+  local tmp
+
+  if [[ ! -f "${STATE_FILE}" ]]; then
+    tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")"
+    printf '{"accounts":{}}\n' > "${tmp}"
+    mv -f "${tmp}" "${STATE_FILE}"
+  fi
+
+  [[ -f "${ORDER_FILE}" ]] || : > "${ORDER_FILE}"
+  [[ -f "${ACTIVE_FILE}" ]] || : > "${ACTIVE_FILE}"
+}
+
+###############################################################################
+# Command implementations
+###############################################################################
+
+cmd_init() {
+  check_prerequisites
+  ensure_account_dirs
+
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    write_default_config
+  fi
+
+  initialize_state_files
+  backup_original_auth_if_needed
+
+  log_success "Initialized ${ACCOUNTS_DIR}"
+  log_info "Credentials directory: ${CREDENTIALS_DIR}"
+  log_info "State file: ${STATE_FILE}"
+}
+
+cmd_add() {
+  require_initialized
+  load_config
+
+  local alias=""
+  local force=0
+
+  if (( $# < 1 )); then
+    die "Usage: ${SCRIPT_NAME} add <alias> [--force]"
+  fi
+
+  alias="$1"
+  shift
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --force) force=1 ;;
+      *) die "Unknown flag for add: $1" ;;
+    esac
+    shift
+  done
+
+  validate_alias "${alias}" || die "Invalid alias '${alias}'. Use only [a-zA-Z0-9_-]."
+
+  if account_exists "${alias}" && (( force == 0 )); then
+    die "Alias '${alias}' already exists. Use --force to replace."
+  fi
+
+   local tmp_home
+  tmp_home="$(mktemp -d "${HOME_DIR}/.codex-tmp.${alias}.XXXXXX")"
+
+  # Use a file to pass tmp_home path to trap safely (avoids unbound variable under set -u after function returns)
+  local tmp_home_ref="${HOME_DIR}/.codex-tmp.${alias}.ref"
+  printf '%s' "${tmp_home}" > "${tmp_home_ref}"
+  trap 'rm -rf "$(cat "'"${tmp_home_ref}"'" 2>/dev/null)" "'"${tmp_home_ref}"'" >/dev/null 2>&1 || true' EXIT
+
+  local source_codex_home
+  source_codex_home="${CODEX_HOME:-${HOME_DIR}/.codex}"
+  if [[ -f "${source_codex_home}/config.toml" ]]; then
+    cp -a "${source_codex_home}/config.toml" "${tmp_home}/config.toml"
+  fi
+
+  log_info "Starting interactive login for alias '${alias}'..."
+  log_info "A browser may open. Complete login then return to terminal."
+
+  CODEX_HOME="${tmp_home}" "${CODEX_BIN}" login
+
+  [[ -f "${tmp_home}/auth.json" ]] || die "Login completed but auth.json not found in temporary CODEX_HOME"
+
+  cp -f "${tmp_home}/auth.json" "${CREDENTIALS_DIR}/${alias}.json"
+  chmod 600 "${CREDENTIALS_DIR}/${alias}.json"
+
+  local lock_cmd
+  lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_add_state" "${alias}")
+  with_lock "${lock_cmd}"
+
+  # Clean up temp dir manually now and clear the EXIT trap (avoids unbound-variable issue under set -u)
+  trap - EXIT
+  rm -rf "${tmp_home}" "${tmp_home_ref}" >/dev/null 2>&1 || true
+
+  log_success "Added account '${alias}'"
+}
+
+internal_add_state() {
+  local alias="$1"
+  init_account_state_entry "${alias}"
+  append_order "${alias}"
+}
+
+cmd_import() {
+  require_initialized
+  load_config
+
+  if (( $# != 2 )); then
+    die "Usage: ${SCRIPT_NAME} import <alias> <path>"
+  fi
+
+  local alias="$1"
+  local path="$2"
+
+  validate_alias "${alias}" || die "Invalid alias '${alias}'. Use only [a-zA-Z0-9_-]."
+  [[ -f "${path}" ]] || die "Credential file not found: ${path}"
+
+  jq -e 'has("auth_mode") and has("tokens")' "${path}" >/dev/null 2>&1 || \
+    die "Invalid auth file. Expected JSON with keys: auth_mode, tokens"
+
+  cp -f "${path}" "${CREDENTIALS_DIR}/${alias}.json"
+  chmod 600 "${CREDENTIALS_DIR}/${alias}.json"
+
+  local lock_cmd
+  lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_add_state" "${alias}")
+  with_lock "${lock_cmd}"
+
+  local account_id id_token email
+  account_id="$(jq -r '.tokens.account_id // ""' "${CREDENTIALS_DIR}/${alias}.json")"
+  id_token="$(jq -r '.tokens.id_token // ""' "${CREDENTIALS_DIR}/${alias}.json")"
+  email="$(extract_email_from_id_token "${id_token}")"
+
+  log_success "Imported account '${alias}'"
+  printf "  account_id: %s\n" "${account_id:-unknown}"
+  printf "  email: %s\n" "${email:-unknown}"
+}
+
+cmd_remove() {
+  require_initialized
+  load_config
+
+  if (( $# != 1 )); then
+    die "Usage: ${SCRIPT_NAME} remove <alias>"
+  fi
+
+  local alias="$1"
+  validate_alias "${alias}" || die "Invalid alias '${alias}'."
+  account_exists "${alias}" || die "Alias '${alias}' does not exist"
+
+  local lock_cmd
+  lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_remove" "${alias}")
+  with_lock "${lock_cmd}"
+
+  log_success "Removed account '${alias}'"
+}
+
+internal_remove() {
+  local alias="$1"
+  local active
+  active="$(get_active)"
+
+  mapfile -t all_aliases < <(get_order)
+  if (( ${#all_aliases[@]} <= 1 )) && [[ "${active}" == "${alias}" ]]; then
+    die "Cannot remove active account '${alias}' because it is the only account"
+  fi
+
+  if [[ "${active}" == "${alias}" ]]; then
+    local next
+    next=""
+    local a
+    for a in "${all_aliases[@]}"; do
+      [[ "${a}" == "${alias}" ]] && continue
+      if [[ -f "${CREDENTIALS_DIR}/${a}.json" ]] && ! is_on_cooldown "${a}"; then
+        next="${a}"
+        break
+      fi
+    done
+    if [[ -z "${next}" ]]; then
+      for a in "${all_aliases[@]}"; do
+        [[ "${a}" == "${alias}" ]] && continue
+        if [[ -f "${CREDENTIALS_DIR}/${a}.json" ]]; then
+          next="${a}"
+          log_warn "No non-cooldown account available. Switching to '${next}' anyway."
+          break
+        fi
+      done
+    fi
+    [[ -n "${next}" ]] || die "Cannot rotate away from '${alias}' before removal"
+    ensure_symlink "${next}"
+    set_active "${next}"
+    set_account_state "${next}" "last_used" "$(now_iso)"
+  fi
+
+  rm -f "${CREDENTIALS_DIR}/${alias}.json"
+  remove_from_order "${alias}"
+  delete_account_state_entry "${alias}"
+
+  if [[ -L "${CODEX_AUTH}" ]]; then
+    local target
+    target="$(readlink "${CODEX_AUTH}" || true)"
+    if [[ "${target}" == *"/${alias}.json" ]]; then
+      local now_active
+      now_active="$(get_active)"
+      if [[ -n "${now_active}" && -f "${CREDENTIALS_DIR}/${now_active}.json" ]]; then
+        ensure_symlink "${now_active}"
+      else
+        rm -f "${CODEX_AUTH}"
+      fi
+    fi
+  fi
+}
+
+render_status_label() {
+  local alias="$1"
+  local active="$2"
+
+  if [[ ! -f "${CREDENTIALS_DIR}/${alias}.json" ]]; then
+    printf "%b✗ NO CREDS%b" "${RED}" "${RESET}"
+    return 0
+  fi
+
+  if [[ "${alias}" == "${active}" ]]; then
+    printf "%b● ACTIVE%b" "${GREEN}" "${RESET}"
+    return 0
+  fi
+
+  if is_on_cooldown "${alias}"; then
+    printf "%b⏸ COOLDOWN%b" "${YELLOW}" "${RESET}"
+    return 0
+  fi
+
+  printf "%b✓ AVAILABLE%b" "${WHITE}" "${RESET}"
+}
+
+cmd_list() {
+  require_initialized
+  load_config
+
+  mapfile -t all_aliases < <(get_order)
+  local active
+  active="$(get_active)"
+
+  printf "%-20s %-16s %-8s %-14s %-12s\n" "ALIAS" "STATUS" "USES" "LAST USED" "COOLDOWN"
+  printf "%-20s %-16s %-8s %-14s %-12s\n" "--------------------" "----------------" "--------" "--------------" "------------"
+
+  if (( ${#all_aliases[@]} == 0 )); then
+    printf "%-20s %-16s %-8s %-14s %-12s\n" "(none)" "-" "-" "-" "-"
+    return 0
+  fi
+
+  local alias status uses last_used last_epoch last_str cooldown_secs cooldown_str
+  for alias in "${all_aliases[@]}"; do
+    status="$(render_status_label "${alias}" "${active}")"
+    uses="$(get_account_state "${alias}" "total_uses")"
+    uses="${uses:-0}"
+    last_used="$(get_account_state "${alias}" "last_used")"
+    last_epoch="$(iso_to_epoch "${last_used}")"
+    last_str="$(format_time_ago "${last_epoch}")"
+    cooldown_secs="$(cooldown_remaining "${alias}")"
+    if (( cooldown_secs > 0 )); then
+      cooldown_str="$(format_duration "${cooldown_secs}") left"
+    else
+      cooldown_str="-"
+    fi
+
+    printf "%-20s %-16b %-8s %-14s %-12s\n" \
+      "${alias}" "${status}" "${uses}" "${last_str}" "${cooldown_str}"
+  done
+}
+
+cmd_switch() {
+  require_initialized
+  load_config
+
+  if (( $# < 1 )); then
+    die "Usage: ${SCRIPT_NAME} switch <alias> [--force]"
+  fi
+
+  local alias="$1"
+  shift
+  local force=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --force) force=1 ;;
+      *) die "Unknown flag for switch: $1" ;;
+    esac
+    shift
+  done
+
+  validate_alias "${alias}" || die "Invalid alias '${alias}'."
+  account_exists "${alias}" || die "Alias '${alias}' does not exist or has no credentials"
+
+  if is_on_cooldown "${alias}" && (( force == 0 )); then
+    local rem
+    rem="$(cooldown_remaining "${alias}")"
+    die "Alias '${alias}' is on cooldown for $(format_duration "${rem}"). Use --force to switch anyway."
+  fi
+
+  local lock_cmd
+  lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_switch" "${alias}")
+  with_lock "${lock_cmd}"
+
+  log_success "Switched active account to '${alias}'"
+}
+
+internal_switch() {
+  local alias="$1"
+  backup_original_auth_if_needed
+  ensure_symlink "${alias}"
+  set_active "${alias}"
+  set_account_state "${alias}" "last_used" "$(now_iso)"
+}
+
+cmd_status() {
+  require_initialized
+  load_config
+
+  mapfile -t all_aliases < <(get_order)
+  local active
+  active="$(get_active)"
+
+  printf "╔══════════════════════════════════════════════════════════╗\n"
+  printf "║           Codex Account Rotation Manager                 ║\n"
+  printf "╠══════════════════════════════════════════════════════════╣\n"
+  printf "║  Account      │ Status      │ Uses │ Last Used │ CD Left ║\n"
+  printf "╠───────────────┼─────────────┼──────┼───────────┼─────────╣\n"
+
+  local available_count=0
+  local alias marker status uses last_used last_epoch ago cd_secs cd_left
+
+  if (( ${#all_aliases[@]} == 0 )); then
+    printf "║  (no accounts configured)                               ║\n"
+  else
+    for alias in "${all_aliases[@]}"; do
+      if [[ "${alias}" == "${active}" ]]; then
+        marker="▶"
+      else
+        marker=" "
+      fi
+
+      status="$(render_status_label "${alias}" "${active}")"
+      uses="$(get_account_state "${alias}" "total_uses")"
+      uses="${uses:-0}"
+      last_used="$(get_account_state "${alias}" "last_used")"
+      last_epoch="$(iso_to_epoch "${last_used}")"
+      ago="$(format_time_ago "${last_epoch}")"
+      cd_secs="$(cooldown_remaining "${alias}")"
+      if (( cd_secs > 0 )); then
+        cd_left="$(format_duration "${cd_secs}")"
+      else
+        cd_left="-"
+      fi
+
+      if [[ -f "${CREDENTIALS_DIR}/${alias}.json" ]] && (( cd_secs == 0 )); then
+        ((available_count+=1))
+      fi
+
+      printf "║ %s %-12.12s │ %-11b │ %4s │ %-9.9s │ %-7.7s ║\n" \
+        "${marker}" "${alias}" "${status}" "${uses}" "${ago}" "${cd_left}"
+    done
+  fi
+
+  printf "╠══════════════════════════════════════════════════════════╣\n"
+  printf "║  Rotation: %-4s │ Accounts: %-2s │ Available: %-2s          ║\n" \
+    "$(format_duration "${ROTATION_INTERVAL}")" "${#all_aliases[@]}" "${available_count}"
+  printf "║  Cooldowns: hourly=%s daily=%s weekly=%s          ║\n" \
+    "$(format_duration "${HOURLY_COOLDOWN}")" "$(format_duration "${DAILY_COOLDOWN}")" "$(format_duration "${WEEKLY_COOLDOWN}")"
+  printf "╚══════════════════════════════════════════════════════════╝\n"
+}
+
+ensure_active_ready() {
+  local active
+  active="$(get_active)"
+
+  if [[ -z "${active}" || ! -f "${CREDENTIALS_DIR}/${active}.json" ]]; then
+    local next
+    next="$(get_next_available)"
+    [[ -n "${next}" ]] || die "No available account with credentials"
+    log_warn "Active account missing/invalid. Switching to '${next}'."
+    internal_switch "${next}"
+    active="${next}"
+  fi
+
+  if is_on_cooldown "${active}"; then
+    local next
+    next="$(get_next_available)"
+    if [[ -n "${next}" && "${next}" != "${active}" ]]; then
+      log_warn "Active account '${active}' on cooldown. Rotating to '${next}'."
+      internal_switch "${next}"
+    else
+      die "All accounts are on cooldown or unavailable"
+    fi
+  fi
+
+  validate_symlink || {
+    local current
+    current="$(get_active)"
+    [[ -n "${current}" ]] || die "No active account set"
+    log_warn "Auth symlink invalid. Rebuilding symlink for '${current}'."
+    ensure_symlink "${current}"
+  }
+}
+
+increment_use_counter() {
+  local alias="$1"
+  local uses
+  uses="$(get_account_state "${alias}" "total_uses")"
+  uses="${uses:-0}"
+  [[ "${uses}" =~ ^[0-9]+$ ]] || uses=0
+  set_account_state "${alias}" "total_uses" "$(( uses + 1 ))"
+  set_account_state "${alias}" "last_used" "$(now_iso)"
+}
+
+run_codex_capture_and_retry() {
+  local -a codex_args=("$@")
+  local attempt=0
+
+  while :; do
+    local out_file
+    out_file="$(mktemp "${HOME_DIR}/.codex-rotate.run.XXXXXX.log")"
+
+    set +e
+    "${CODEX_BIN}" "${codex_args[@]}" 2>&1 | tee "${out_file}"
+    local cmd_exit=${PIPESTATUS[0]}
+    set -e
+
+    if (( cmd_exit != 0 )) && detect_rate_limit "${out_file}"; then
+      local current cd_seconds next
+      current="$(get_active)"
+      cd_seconds="$(classify_cooldown "${out_file}")"
+
+      local lock_cmd
+      lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_mark_rate_limit" "${current}" "${cd_seconds}")
+      with_lock "${lock_cmd}"
+
+      printf "[codex-rotate] ⚠ Rate limit hit on %s. Rotating to next account...\n" "${current}" >&2
+
+      next="$(get_next_available)"
+      if [[ -z "${next}" || "${next}" == "${current}" ]]; then
+        rm -f "${out_file}"
+        die "Rate limit detected on '${current}' but no alternate account is available"
+      fi
+
+      local switch_cmd
+      switch_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_switch" "${next}")
+      with_lock "${switch_cmd}"
+
+      rm -f "${out_file}"
+      attempt=$(( attempt + 1 ))
+      if (( attempt > MAX_RETRIES )); then
+        die "Exceeded MAX_RETRIES (${MAX_RETRIES}) after rate limit rotations"
+      fi
+      continue
+    fi
+
+    rm -f "${out_file}"
+
+    if (( cmd_exit == 0 )); then
+      local active
+      active="$(get_active)"
+      local lock_cmd
+      lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_increment_use" "${active}")
+      with_lock "${lock_cmd}"
+    fi
+
+    return "${cmd_exit}"
+  done
+}
+
+internal_mark_rate_limit() {
+  local alias="$1"
+  local seconds="$2"
+  mark_rate_limit_hit "${alias}" "${seconds}"
+}
+
+internal_increment_use() {
+  local alias="$1"
+  increment_use_counter "${alias}"
+}
+
+cmd_run() {
+  require_initialized
+  load_config
+
+  local lock_cmd
+  lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_ensure_active_ready")
+  with_lock "${lock_cmd}"
+
+  # Interactive mode detection:
+  # - no args: run codex directly (full TTY)
+  # - args without 'exec': treat as potentially interactive and run direct
+  # - args with 'exec': capture output for RL detection and retry
+  local interactive=0
+  if (( $# == 0 )); then
+    interactive=1
+  else
+    local has_exec=0
+    local arg
+    for arg in "$@"; do
+      if [[ "${arg}" == "exec" ]]; then
+        has_exec=1
+        break
+      fi
+    done
+    if (( has_exec == 0 )); then
+      interactive=1
+    fi
+  fi
+
+  if (( interactive == 1 )); then
+    # For interactive/TUI mode we cannot pipe output without destroying the TTY.
+    # Strategy: run codex directly (full TTY), capture exit code, then scan a
+    # background tee of stderr to a temp file for rate-limit signals.
+    # If codex exits with a non-zero code AND a rate-limit pattern is detected
+    # in the last N lines written to a side-channel stderr log, rotate and retry.
+    local attempt=0
+    while :; do
+      local err_file
+      err_file="$(mktemp "${HOME_DIR}/.codex-rotate.interactive.XXXXXX.log")"
+
+      set +e
+      # Run codex with TTY intact for stdout, but tee stderr to our log file
+      # using process substitution so the user still sees all stderr output.
+      { "${CODEX_BIN}" "$@" 2> >(tee "${err_file}" >&2); } 
+      local cmd_exit=$?
+      set -e
+
+      # Give the tee sub-process a moment to flush
+      sleep 0.1
+
+      if (( cmd_exit != 0 )) && detect_rate_limit "${err_file}"; then
+        local current cd_seconds next
+        current="$(get_active)"
+        cd_seconds="$(classify_cooldown "${err_file}")"
+
+        local lock_cmd
+        lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_mark_rate_limit" "${current}" "${cd_seconds}")
+        with_lock "${lock_cmd}"
+
+        printf "[codex-rotate] ⚠ Rate limit hit on '%s'. Rotating to next account...\n" "${current}" >&2
+
+        next="$(get_next_available)"
+        if [[ -n "${next}" && "${next}" != "${current}" ]]; then
+          local switch_cmd
+          switch_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_switch" "${next}")
+          with_lock "${switch_cmd}"
+
+          rm -f "${err_file}"
+          attempt=$(( attempt + 1 ))
+          if (( attempt > MAX_RETRIES )); then
+            die "Exceeded MAX_RETRIES (${MAX_RETRIES}) after rate limit rotations"
+          fi
+          printf "[codex-rotate] ↩ Retrying on '%s'...\n" "${next}" >&2
+          continue
+        else
+          rm -f "${err_file}"
+          die "Rate limit on '${current}' but no alternate account available"
+        fi
+      fi
+
+      rm -f "${err_file}"
+
+      if (( cmd_exit == 0 )); then
+        local active
+        active="$(get_active)"
+        local update_cmd
+        update_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_increment_use" "${active}")
+        with_lock "${update_cmd}"
+      fi
+
+      return "${cmd_exit}"
+    done
+    return
+  fi
+
+  run_codex_capture_and_retry "$@"
+}
+
+internal_ensure_active_ready() {
+  ensure_active_ready
+}
+
+cmd_auto() {
+  require_initialized
+  load_config
+
+  local lock_cmd
+  lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_auto_preflight")
+  with_lock "${lock_cmd}"
+
+  cmd_run "$@"
+}
+
+internal_auto_preflight() {
+  ensure_active_ready
+
+  local active last_used last_epoch now diff
+  active="$(get_active)"
+  [[ -n "${active}" ]] || return 0
+
+  last_used="$(get_account_state "${active}" "last_used")"
+  last_epoch="$(iso_to_epoch "${last_used}")"
+  now="$(now_epoch)"
+
+  if (( last_epoch > 0 )); then
+    diff=$(( now - last_epoch ))
+    if (( diff > ROTATION_INTERVAL )); then
+      local next
+      next="$(get_next_available)"
+      if [[ -n "${next}" && "${next}" != "${active}" ]]; then
+        log_info "Rotation interval exceeded ($(format_duration "${diff}")). Switching '${active}' -> '${next}'."
+        internal_switch "${next}"
+      fi
+    fi
+  fi
+}
+
+cmd_cooldown() {
+  require_initialized
+  load_config
+
+  if (( $# < 1 )); then
+    die "Usage: ${SCRIPT_NAME} cooldown <alias> [--hours N | --days N | --weeks N]"
+  fi
+
+  local alias="$1"
+  shift
+
+  validate_alias "${alias}" || die "Invalid alias '${alias}'."
+  account_exists "${alias}" || die "Alias '${alias}' not found"
+
+  local seconds="${HOURLY_COOLDOWN}"
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --hours)
+        shift
+        [[ $# -gt 0 ]] || die "--hours requires value"
+        [[ "$1" =~ ^[0-9]+$ ]] || die "--hours value must be integer"
+        seconds=$(( $1 * 3600 ))
+        ;;
+      --days)
+        shift
+        [[ $# -gt 0 ]] || die "--days requires value"
+        [[ "$1" =~ ^[0-9]+$ ]] || die "--days value must be integer"
+        seconds=$(( $1 * 86400 ))
+        ;;
+      --weeks)
+        shift
+        [[ $# -gt 0 ]] || die "--weeks requires value"
+        [[ "$1" =~ ^[0-9]+$ ]] || die "--weeks value must be integer"
+        seconds=$(( $1 * 604800 ))
+        ;;
+      *)
+        die "Unknown flag for cooldown: $1"
+        ;;
+    esac
+    shift
+  done
+
+  local cmd
+  cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_cooldown" "${alias}" "${seconds}")
+  with_lock "${cmd}"
+
+  log_success "Account '${alias}' put on cooldown for $(format_duration "${seconds}")"
+}
+
+internal_cooldown() {
+  local alias="$1"
+  local seconds="$2"
+  mark_rate_limit_hit "${alias}" "${seconds}"
+}
+
+cmd_uncooldown() {
+  require_initialized
+  load_config
+
+  if (( $# != 1 )); then
+    die "Usage: ${SCRIPT_NAME} uncooldown <alias>"
+  fi
+
+  local alias="$1"
+  validate_alias "${alias}" || die "Invalid alias '${alias}'."
+  account_exists "${alias}" || die "Alias '${alias}' not found"
+
+  local cmd
+  cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_uncooldown" "${alias}")
+  with_lock "${cmd}"
+
+  log_success "Cooldown cleared for '${alias}'"
+}
+
+internal_uncooldown() {
+  local alias="$1"
+  set_account_state "${alias}" "cooldown_until" "0"
+}
+
+cmd_help() {
+  cat <<EOF
+${SCRIPT_NAME} v${SCRIPT_VERSION}
+
+Codex account rotation manager.
+
+Usage:
+  ${SCRIPT_NAME} <command> [args]
+
+Commands:
+  init
+      Initialize ~/.codex-accounts structure and default config.
+
+  add <alias> [--force]
+      Interactive login flow to add account credentials under alias.
+
+  import <alias> <path>
+      Import existing auth.json file as an account alias.
+
+  remove <alias>
+      Remove an account alias and associated state.
+
+  list
+      Show account table (alias, status, uses, last used, cooldown).
+
+  switch <alias> [--force]
+      Switch active account by atomically updating auth.json symlink.
+
+  status
+      Show dashboard view of accounts and rotation configuration.
+
+  run [codex args...]
+      Transparent codex wrapper with automatic rate-limit rotation/retry.
+
+  auto [codex args...]
+      Same as run, but pre-rotates if last_used exceeds ROTATION_INTERVAL.
+
+  cooldown <alias> [--hours N | --days N | --weeks N]
+      Manually put account on cooldown (default: 1 hour).
+
+  uncooldown <alias>
+      Manually clear account cooldown.
+
+  help
+      Show this help.
+
+Notes:
+  - Credentials are stored at: ${CREDENTIALS_DIR}/<alias>.json
+  - Active auth symlink: ${CODEX_AUTH}
+  - State file: ${STATE_FILE}
+  - Config file: ${CONFIG_FILE}
+  - Override codex binary via CODEX_BIN in config.sh
+EOF
+}
+
+###############################################################################
+# Internal command router (for lock-safe mutations)
+###############################################################################
+
+dispatch_internal() {
+  local subcmd="$1"
+  shift
+  case "${subcmd}" in
+    __internal_add_state) internal_add_state "$@" ;;
+    __internal_remove) internal_remove "$@" ;;
+    __internal_switch) internal_switch "$@" ;;
+    __internal_mark_rate_limit) internal_mark_rate_limit "$@" ;;
+    __internal_increment_use) internal_increment_use "$@" ;;
+    __internal_ensure_active_ready) internal_ensure_active_ready "$@" ;;
+    __internal_auto_preflight) internal_auto_preflight "$@" ;;
+    __internal_cooldown) internal_cooldown "$@" ;;
+    __internal_uncooldown) internal_uncooldown "$@" ;;
+    *) die "Unknown internal subcommand: ${subcmd}" ;;
+  esac
+}
+
+###############################################################################
+# Main command router
+###############################################################################
+
+main() {
+  check_prerequisites
+
+  local cmd="${1:-help}"
+  shift || true
+
+  # Internal subcommands are not public; used through with_lock.
+  if [[ "${cmd}" == __internal_* ]]; then
+    require_initialized
+    load_config
+    dispatch_internal "${cmd}" "$@"
+    return 0
+  fi
+
+  case "${cmd}" in
+    init) cmd_init "$@" ;;
+    add) cmd_add "$@" ;;
+    import) cmd_import "$@" ;;
+    remove) cmd_remove "$@" ;;
+    list) cmd_list "$@" ;;
+    switch) cmd_switch "$@" ;;
+    status) cmd_status "$@" ;;
+    run) cmd_run "$@" ;;
+    auto) cmd_auto "$@" ;;
+    cooldown) cmd_cooldown "$@" ;;
+    uncooldown) cmd_uncooldown "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)
+      log_error "Unknown command: ${cmd}"
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
