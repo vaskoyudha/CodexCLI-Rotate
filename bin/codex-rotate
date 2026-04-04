@@ -768,6 +768,7 @@ OPENAI_CLIENT_ID="app_EMoamEEZ73f0CkXaXp7hrann"
 
 query_usage_api() {
   # Query the OpenAI usage API for a given account.
+  # Retries once with a token refresh on 401/403.
   # Returns: raw JSON response or empty string on failure.
   local alias="$1"
   local tokens access_token account_id
@@ -783,25 +784,47 @@ query_usage_api() {
   access_token="$(printf "%s" "${tokens}" | jq -r '.access_token // empty')"
   account_id="$(printf "%s" "${tokens}" | jq -r '.account_id // empty')"
 
+  # Fallback: derive account_id from JWT if not stored in tokens
+  if [[ -z "${account_id}" ]]; then
+    account_id="$(extract_account_id_from_token "${access_token}")"
+  fi
+
   [[ -n "${access_token}" ]] || { printf ""; return 0; }
 
-  local response http_code
-  response="$(curl -sS --max-time 10 \
-    -H "Authorization: Bearer ${access_token}" \
-    -H "User-Agent: codex-cli/1.0.0" \
-    ${account_id:+-H "chatgpt-account-id: ${account_id}"} \
-    -w "\n%{http_code}" \
-    "${OPENAI_USAGE_URL}" 2>/dev/null || true)"
+  local response http_code attempt
+  for attempt in 1 2; do
+    response="$(curl -sS --max-time 10 \
+      -H "Authorization: Bearer ${access_token}" \
+      -H "User-Agent: codex-cli/1.0.0" \
+      ${account_id:+-H "chatgpt-account-id: ${account_id}"} \
+      -w "\n%{http_code}" \
+      "${OPENAI_USAGE_URL}" 2>/dev/null || true)"
 
-  # Split response body and HTTP code
-  http_code="$(printf "%s" "${response}" | tail -n1)"
-  response="$(printf "%s" "${response}" | sed '$d')"
+    # Split response body and HTTP code
+    http_code="$(printf "%s" "${response}" | tail -n1)"
+    response="$(printf "%s" "${response}" | sed '$d')"
 
-  if [[ "${http_code}" == "200" ]] && printf "%s" "${response}" | jq -e '.' >/dev/null 2>&1; then
-    printf "%s" "${response}"
-  else
-    printf ""
-  fi
+    if [[ "${http_code}" == "200" ]] && printf "%s" "${response}" | jq -e '.' >/dev/null 2>&1; then
+      printf "%s" "${response}"
+      return 0
+    fi
+
+    # On 401/403, try refreshing the token and retry once
+    if [[ "${attempt}" -eq 1 ]] && [[ "${http_code}" == "401" || "${http_code}" == "403" ]]; then
+      if refresh_account_token "${alias}" 2>/dev/null; then
+        # Re-read tokens after refresh
+        tokens="$(get_account_tokens "${alias}")"
+        access_token="$(printf "%s" "${tokens}" | jq -r '.access_token // empty')"
+        [[ -n "${access_token}" ]] || break
+      else
+        break
+      fi
+    else
+      break
+    fi
+  done
+
+  printf ""
 }
 
 refresh_account_token() {
@@ -830,7 +853,9 @@ refresh_account_token() {
   response="$(curl -sS --max-time 15 \
     -X POST "${OPENAI_REFRESH_URL}" \
     -H "Content-Type: application/x-www-form-urlencoded" \
-    -d "grant_type=refresh_token&refresh_token=${refresh_token}&client_id=${OPENAI_CLIENT_ID}" \
+    --data-urlencode "grant_type=refresh_token" \
+    --data-urlencode "refresh_token=${refresh_token}" \
+    --data-urlencode "client_id=${OPENAI_CLIENT_ID}" \
     -w "\n%{http_code}" \
     2>/dev/null || true)"
 
@@ -889,6 +914,27 @@ parse_usage_reset_at() {
   local usage_json="$1"
   [[ -n "${usage_json}" ]] || { printf ""; return 0; }
   printf "%s" "${usage_json}" | jq -r '.rate_limit.primary_window.reset_at // empty' 2>/dev/null || true
+}
+
+parse_reset_epoch() {
+  # Convert a reset_at value to a Unix epoch.
+  # Handles: Unix epoch (integer/float), ISO 8601 timestamps, empty.
+  local reset_at="$1"
+  [[ -n "${reset_at}" ]] || { printf "0"; return 0; }
+
+  # If it's already a numeric epoch (integer or float like 1712345678 or 1712345678.123)
+  if [[ "${reset_at}" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+    # Strip fractional part
+    printf "%s" "${reset_at%%.*}"
+    return 0
+  fi
+
+  # Try ISO 8601 parsing (GNU date, then BSD date)
+  local epoch
+  epoch="$(date -d "${reset_at}" +%s 2>/dev/null)" && { printf "%s" "${epoch}"; return 0; }
+  epoch="$(date -j -f "%Y-%m-%dT%H:%M:%S" "${reset_at%%.*}" +%s 2>/dev/null)" && { printf "%s" "${epoch}"; return 0; }
+
+  printf "0"
 }
 
 format_usage_bar() {
@@ -1693,7 +1739,7 @@ cmd_quota() {
     format_usage_bar "${primary_pct}"
     if [[ -n "${primary_reset}" ]]; then
       local reset_epoch now_epoch_val remaining_secs
-      reset_epoch="$(date -d "${primary_reset}" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${primary_reset%%.*}" +%s 2>/dev/null || echo 0)"
+      reset_epoch="$(parse_reset_epoch "${primary_reset}")"
       now_epoch_val="$(now_epoch)"
       if (( reset_epoch > now_epoch_val )); then
         remaining_secs=$(( reset_epoch - now_epoch_val ))
@@ -1710,7 +1756,7 @@ cmd_quota() {
     format_usage_bar "${secondary_pct}"
     if [[ -n "${secondary_reset}" ]]; then
       local reset_epoch2 now_epoch_val2 remaining_secs2
-      reset_epoch2="$(date -d "${secondary_reset}" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${secondary_reset%%.*}" +%s 2>/dev/null || echo 0)"
+      reset_epoch2="$(parse_reset_epoch "${secondary_reset}")"
       now_epoch_val2="$(now_epoch)"
       if (( reset_epoch2 > now_epoch_val2 )); then
         remaining_secs2=$(( reset_epoch2 - now_epoch_val2 ))
@@ -1782,7 +1828,7 @@ cmd_refresh() {
     die "No accounts configured. Use '${SCRIPT_NAME} add' first."
   fi
 
-  local alias
+  local alias had_failure=0
   for alias in "${aliases_to_refresh[@]}"; do
     printf "Refreshing tokens for '%s'... " "${alias}"
     if refresh_account_token "${alias}"; then
@@ -1791,8 +1837,10 @@ cmd_refresh() {
       printf "%b✓%b (%s)\n" "${GREEN}" "${RESET}" "${email:-refreshed}"
     else
       printf "%b✗%b (failed)\n" "${RED}" "${RESET}"
+      had_failure=1
     fi
   done
+  return "${had_failure}"
 }
 
 cmd_help() {
@@ -1818,7 +1866,7 @@ Commands:
       Remove an account alias and associated state.
 
   list
-      Show account table (alias, status, uses, last used, cooldown).
+      Show account table (alias, email, status, uses, plan, last used, cooldown).
 
   switch <alias> [--force]
       Switch active account by atomically updating auth.json symlink.

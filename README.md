@@ -46,9 +46,9 @@ $ codex-rotate add work
 [OK] Account 'work' added and credentials stored.
 
 $ codex-rotate list
-  ACCOUNT      STATUS      LAST USED
-  personal *   ready       2 min ago
-  work         ready       just now
+  ALIAS        EMAIL                  STATUS   USES  PLAN   LAST USED    COOLDOWN
+  personal *   user@gmail.com         ready    14    plus   2 min ago    —
+  work         work@company.com       ready    3     team   just now     —
 
 $ codex-rotate run exec "Refactor the auth module to use JWT"
 [INFO] Running with account 'personal'...
@@ -60,13 +60,13 @@ $ codex-rotate run exec "Refactor the auth module to use JWT"
 # ... codex continues seamlessly ...
 
 $ codex-rotate status
-╔══════════════════════════════════════════════════════════╗
-║                  codex-rotate dashboard                  ║
-╠══════════════════════════════════════════════════════════╣
-║  ACCOUNT     STATUS     USES   COOLDOWN   LAST USED     ║
-║  personal    cooldown   14     47m left   3 min ago      ║
-║  work *      ready      3      —          just now       ║
-╚══════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║              Codex Account Rotation Manager v1.1.0                               ║
+╠═══════════════════════════════════════════════════════════════════════════════════╣
+║  ACCOUNT     EMAIL                STATUS     USES   PLAN   COOLDOWN   LAST USED  ║
+║  personal    user@gmail.com       cooldown   14     plus   47m left   3 min ago   ║
+║  work *      work@company.com     ready      3      team   —          just now    ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
 
 $ codex-rotate quota
 ━━━ personal ━━━
@@ -234,7 +234,7 @@ CODEX_BIN=""              # Path to codex binary (auto-detected if empty)
 
 - **Bash 4+** — Required for associative arrays. macOS users: `brew install bash`.
 - **jq** — JSON processor for auth files. The installer will auto-install if missing on Linux.
-- **curl** — Required for `quota`, `email`, and `refresh` commands (usually pre-installed).
+- **curl** — Required for `quota` and `refresh` commands (usually pre-installed).
 - **flock** — Concurrent-safe file locking (part of `util-linux`). macOS users: `brew install util-linux`.
 - **Codex CLI** — The official OpenAI Codex CLI must be installed.
 

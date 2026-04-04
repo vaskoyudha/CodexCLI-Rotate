@@ -706,10 +706,9 @@ ENDJSON
 
 @test "refresh command runs without crash" {
   _setup_account_with_jwt "myacct"
-  # Will fail to reach API but should not crash
+  # Will fail to reach API but should not crash — exits non-zero on failure
   run codex-rotate refresh myacct
-  # Refresh will fail (no real API) but should exit 0 and show alias
-  assert_success
+  assert_failure
   assert_output_contains "myacct"
 }
 
@@ -765,4 +764,109 @@ ENDJSON
   run codex-rotate help
   assert_success
   assert_output_contains "refresh"
+}
+
+# ---------------------------------------------------------------------------
+# Mocked API success tests
+# ---------------------------------------------------------------------------
+
+# Helper: create a mock curl that returns a canned usage API response
+_mock_curl_usage_success() {
+  cat > "$HOME/bin/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+# Return a canned usage API response with 200 status
+cat <<'RESPONSE'
+{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_at":9999999999},"secondary_window":{"used_percent":15,"limit_window_seconds":604800,"reset_at":9999999999}},"credits":{"has_credits":true,"unlimited":true,"balance":null}}
+200
+RESPONSE
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
+}
+
+# Helper: create a mock curl that returns a canned token refresh response
+_mock_curl_refresh_success() {
+  cat > "$HOME/bin/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+# Return a canned refresh token response with 200 status
+cat <<'RESPONSE'
+{"id_token":"eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InJlZnJlc2hlZEBleGFtcGxlLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMiLCJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2N0X3Rlc3QxMjMifX0.fakesig","access_token":"new_access_token","refresh_token":"new_refresh_token"}
+200
+RESPONSE
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
+}
+
+@test "quota command with mocked API shows usage bars" {
+  _setup_account_with_jwt "mockacct"
+  _mock_curl_usage_success
+  run codex-rotate quota mockacct
+  assert_success
+  assert_output_contains "mockacct"
+  assert_output_contains "test@example.com"
+  assert_output_contains "42%"
+  assert_output_contains "15%"
+  assert_output_contains "Unlimited"
+}
+
+@test "quota command with mocked API shows plan from API" {
+  _setup_account_with_jwt "mockacct"
+  _mock_curl_usage_success
+  run codex-rotate quota mockacct
+  assert_success
+  assert_output_contains "Plan (API): plus"
+}
+
+@test "refresh command with mocked API succeeds" {
+  _setup_account_with_jwt "mockacct"
+  _mock_curl_refresh_success
+  run codex-rotate refresh mockacct
+  assert_success
+  assert_output_contains "mockacct"
+}
+
+@test "refresh command with mocked API updates credential file" {
+  _setup_account_with_jwt "mockacct"
+  _mock_curl_refresh_success
+  run codex-rotate refresh mockacct
+  assert_success
+  # Verify the credential file was updated with new tokens
+  run jq -r '.tokens.access_token' "$HOME/.codex-accounts/credentials/mockacct.json"
+  assert_success
+  [[ "$output" == "new_access_token" ]]
+}
+
+@test "refresh failure returns non-zero exit code" {
+  _setup_account_with_jwt "failacct"
+  # Default curl will fail (no mock or real API)
+  run codex-rotate refresh failacct
+  assert_failure
+  assert_output_contains "failacct"
+}
+
+# ---------------------------------------------------------------------------
+# Quota-aware rotation tests
+# ---------------------------------------------------------------------------
+
+@test "help describes list with email and plan columns" {
+  run codex-rotate help
+  assert_success
+  assert_output_contains "email"
+  assert_output_contains "plan"
+}
+
+@test "quota command handles epoch reset_at values" {
+  _setup_account_with_jwt "epochacct"
+  # Mock curl to return epoch-based reset_at
+  cat > "$HOME/bin/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+cat <<'RESPONSE'
+{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":30,"limit_window_seconds":18000,"reset_at":9999999999},"secondary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_at":9999999999}},"credits":{"has_credits":true,"unlimited":true,"balance":null}}
+200
+RESPONSE
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
+  run codex-rotate quota epochacct
+  assert_success
+  assert_output_contains "30%"
+  assert_output_contains "resets in"
 }

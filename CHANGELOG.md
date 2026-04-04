@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2025-04-05
+
+### Fixed
+- `refresh` command now returns non-zero exit code when any token refresh fails
+- Refresh token values are URL-encoded before sending to OAuth endpoint
+- `quota` command correctly parses both Unix epoch and ISO 8601 `reset_at` timestamps
+- `query_usage_api` auto-retries once on 401/403 by refreshing the access token
+- `query_usage_api` falls back to extracting `account_id` from JWT when not in credentials file
+- `help` text for `list` now accurately describes all 7 columns (alias, email, status, uses, plan, last used, cooldown)
+- README demo examples updated to match current 7-column list/status output
+
+### Added
+- `parse_reset_epoch()` helper function for robust reset timestamp handling
+- 7 new mocked-API BATS tests covering quota display, refresh success/failure, credential file updates, help accuracy, and epoch timestamp parsing (69 total tests)
+
 ## [1.1.0] - 2025-04-05
 
 ### Added
