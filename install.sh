@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# codex-rotate installer
+# Supports both local (git clone) and remote (curl | bash) installation.
+
+REPO_URL="https://raw.githubusercontent.com/vaskoyudha/MultipleAccountCodex/main"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_SCRIPT="${SCRIPT_DIR}/codex-rotate"
 INSTALL_DIR="${HOME}/.local/bin"
 TARGET_SCRIPT="${INSTALL_DIR}/codex-rotate"
+
+# Determine source: local clone or remote download
+if [[ -f "${SCRIPT_DIR}/bin/codex-rotate" ]]; then
+  SOURCE_MODE="local"
+  SOURCE_SCRIPT="${SCRIPT_DIR}/bin/codex-rotate"
+elif [[ -f "${SCRIPT_DIR}/codex-rotate" ]]; then
+  # Backward compat: old layout with codex-rotate in root
+  SOURCE_MODE="local"
+  SOURCE_SCRIPT="${SCRIPT_DIR}/codex-rotate"
+else
+  SOURCE_MODE="remote"
+  SOURCE_SCRIPT=""
+fi
 
 RED="\033[31m"
 GREEN="\033[32m"

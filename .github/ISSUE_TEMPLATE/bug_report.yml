@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a bug in codex-rotate
+labels: ["bug"]
+
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Clear and concise description of the bug
+      placeholder: What is the problem?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior
+      placeholder: |
+        1. First step
+        2. Second step
+        3. Third step
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should happen?
+      placeholder: The script should...
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happens?
+      placeholder: Instead, the script...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Your system information
+      placeholder: |
+        OS: (e.g., macOS 14.0, Ubuntu 22.04, etc.)
+        Bash version: $(bash --version)
+        Codex CLI version: (from 'codex --version')
+        codex-rotate version: (from script header)
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant logs or error messages (will be rendered as code)
+      render: shell
+    validations:
+      required: false
