@@ -71,16 +71,18 @@ install_jq_if_missing() {
   log_warn "jq is missing. Attempting installation..."
 
   local installer=""
-  if have_cmd apt-get; then
+  if have_cmd brew; then
+    installer="brew"
+  elif have_cmd apt-get; then
     installer="apt-get"
   elif have_cmd dnf; then
     installer="dnf"
   else
-    die "Could not find apt-get or dnf to install jq. Install jq manually and re-run."
+    die "Could not find brew, apt-get, or dnf to install jq. Install jq manually and re-run."
   fi
 
   local prefix=()
-  if (( EUID != 0 )); then
+  if [[ "${installer}" != "brew" ]] && (( EUID != 0 )); then
     if have_cmd sudo; then
       prefix=(sudo)
     else
@@ -88,7 +90,9 @@ install_jq_if_missing() {
     fi
   fi
 
-  if [[ "${installer}" == "apt-get" ]]; then
+  if [[ "${installer}" == "brew" ]]; then
+    brew install jq
+  elif [[ "${installer}" == "apt-get" ]]; then
     "${prefix[@]}" apt-get update
     "${prefix[@]}" apt-get install -y jq
   else
@@ -100,8 +104,14 @@ install_jq_if_missing() {
 }
 
 check_flock() {
-  have_cmd flock || die "flock not found (expected from util-linux)"
-  log_success "flock available"
+  if have_cmd flock; then
+    log_success "flock available"
+    return 0
+  fi
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    die "flock not found. On macOS, install via: brew install util-linux"
+  fi
+  die "flock not found (expected from util-linux). Install util-linux and re-run."
 }
 
 install_script() {

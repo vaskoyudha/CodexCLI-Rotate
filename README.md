@@ -129,7 +129,7 @@ cd MultipleAccountCodex
 make install
 ```
 
-> **Note**: All methods install to `~/.local/bin`. Make sure it's in your `$PATH`. The installer will detect your shell and tell you the exact line to add if needed.
+> **Note**: `npm install -g` installs to npm's global prefix (usually `/usr/local/bin`). The curl installer and `make install` install to `~/.local/bin` — make sure it's in your `$PATH`. The installer will detect your shell and tell you the exact line to add if needed.
 
 ## Usage
 
@@ -200,11 +200,13 @@ CODEX_BIN=""              # Path to codex binary (auto-detected if empty)
 | Atomic symlink switching (zero downtime) | Modify Codex CLI internals |
 | Track per-account usage and cooldowns | Work on Windows (Linux/macOS only) |
 
+> **Disclaimer**: This tool manages multiple legitimately-owned Codex CLI accounts. It does not bypass, circumvent, or evade rate limits — it switches between your own accounts when one hits its limit. Please ensure your usage complies with OpenAI's [Terms of Use](https://openai.com/policies/terms-of-use).
+
 ## Requirements
 
 - **Bash 4+** — Required for associative arrays. macOS users: `brew install bash`.
-- **jq** — JSON processor for auth files. The installer will auto-install if missing.
-- **flock** — Concurrent-safe file locking (part of `util-linux`).
+- **jq** — JSON processor for auth files. The installer will auto-install if missing on Linux.
+- **flock** — Concurrent-safe file locking (part of `util-linux`). macOS users: `brew install util-linux`.
 - **Codex CLI** — The official OpenAI Codex CLI must be installed.
 
 ## Uninstall
@@ -242,13 +244,13 @@ Yes. Credentials are stored in a dedicated directory with `700` permissions, and
 The script displays a warning that all accounts are on cooldown and exits with an error. Accounts automatically become available again after their cooldown period expires.
 
 **Does it work on macOS?**
-Yes, but macOS ships with Bash 3.x. Install Bash 4+ via `brew install bash` and ensure it's in your `$PATH`.
+Yes, but macOS requires additional setup. macOS ships with Bash 3.x and does not include `flock`. Install both via Homebrew: `brew install bash util-linux`, then ensure the Homebrew `bash` and `flock` are in your `$PATH`.
 
 **Can I use this with other AI CLI tools?**
 It's designed for Codex CLI, but the auth.json symlink pattern could be adapted for other tools that use file-based authentication.
 
 **How many accounts can I add?**
-No hard limit. Tested with 10+ accounts.
+No hard limit. The tool uses flat files, so performance stays consistent regardless of account count.
 
 ## Contributing
 

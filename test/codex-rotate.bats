@@ -242,3 +242,348 @@ _install_fake_codex() {
   assert_failure
   assert_output_contains "does not exist"
 }
+
+# ---------------------------------------------------------------------------
+# Additional coverage: rotation core behaviors
+# ---------------------------------------------------------------------------
+
+_write_mock_auth() {
+  local path="$1"
+  local account_id="$2"
+  printf '{"auth_mode":"login","tokens":{"account_id":"%s","id_token":"tok-%s"}}\n' "$account_id" "$account_id" > "$path"
+}
+
+_import_account() {
+  local alias="$1"
+  local account_id="$2"
+  local auth_path="$HOME/${alias}-auth.json"
+  _write_mock_auth "$auth_path" "$account_id"
+  run codex-rotate import "$alias" "$auth_path"
+  assert_success
+}
+
+@test "switch creates auth symlink to selected account credentials" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account account1 acc1
+  _import_account account2 acc2
+
+  run codex-rotate switch account1
+  assert_success
+
+  [[ -L "$HOME/.codex/auth.json" ]]
+  [[ "$(readlink "$HOME/.codex/auth.json")" == "$HOME/.codex-accounts/credentials/account1.json" ]]
+}
+
+@test "switching accounts updates auth symlink target" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account alpha acca
+  _import_account beta accb
+
+  run codex-rotate switch alpha
+  assert_success
+  [[ "$(readlink "$HOME/.codex/auth.json")" == "$HOME/.codex-accounts/credentials/alpha.json" ]]
+
+  run codex-rotate switch beta
+  assert_success
+  [[ "$(readlink "$HOME/.codex/auth.json")" == "$HOME/.codex-accounts/credentials/beta.json" ]]
+}
+
+@test "switch --force bypasses cooldown" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account one acc1
+
+  run codex-rotate cooldown one --hours 2
+  assert_success
+  run codex-rotate switch one
+  assert_failure
+  assert_output_contains "on cooldown"
+
+  run codex-rotate switch one --force
+  assert_success
+  [[ "$(<"$HOME/.codex-accounts/active")" == "one" ]]
+}
+
+@test "run exec rotates on 429 rate-limit signal" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account rl1 acc1
+  _import_account rl2 acc2
+  run codex-rotate switch rl1
+  assert_success
+
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\nmarker="$HOME/fake-codex-first-hit"\nif [[ ! -f "$marker" ]]; then\n  : > "$marker"\n  echo "429 Too Many Requests" >&2\n  exit 1\nfi\necho "ok after rotate"\n' > "$HOME/bin/codex"
+  chmod +x "$HOME/bin/codex"
+
+  run codex-rotate run exec "test"
+  assert_success
+  assert_output_contains "ok after rotate"
+  [[ "$(<"$HOME/.codex-accounts/active")" == "rl2" ]]
+}
+
+@test "run exec rotates on usageLimitExceeded signal" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account ul1 acc1
+  _import_account ul2 acc2
+  run codex-rotate switch ul1
+  assert_success
+
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\nmarker="$HOME/fake-codex-first-hit"\nif [[ ! -f "$marker" ]]; then\n  : > "$marker"\n  echo "usageLimitExceeded" >&2\n  exit 1\nfi\necho "recovered"\n' > "$HOME/bin/codex"
+  chmod +x "$HOME/bin/codex"
+
+  run codex-rotate run exec "test"
+  assert_success
+  assert_output_contains "recovered"
+  [[ "$(<"$HOME/.codex-accounts/active")" == "ul2" ]]
+}
+
+@test "run exec rotates on generic rate limit text" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account rt1 acc1
+  _import_account rt2 acc2
+  run codex-rotate switch rt1
+  assert_success
+
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\nmarker="$HOME/fake-codex-first-hit"\nif [[ ! -f "$marker" ]]; then\n  : > "$marker"\n  echo "rate limit exceeded" >&2\n  exit 1\nfi\necho "retry success"\n' > "$HOME/bin/codex"
+  chmod +x "$HOME/bin/codex"
+
+  run codex-rotate run exec "test"
+  assert_success
+  assert_output_contains "retry success"
+  [[ "$(<"$HOME/.codex-accounts/active")" == "rt2" ]]
+}
+
+@test "run exec does not rotate on non-rate-limit failure" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account nr1 acc1
+  _import_account nr2 acc2
+  run codex-rotate switch nr1
+  assert_success
+
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\necho "fatal: unrelated error" >&2\nexit 1\n' > "$HOME/bin/codex"
+  chmod +x "$HOME/bin/codex"
+
+  run codex-rotate run exec "test"
+  assert_failure
+  assert_output_contains "unrelated error"
+  [[ "$(<"$HOME/.codex-accounts/active")" == "nr1" ]]
+}
+
+@test "cooldown marks account as cooldown in list" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account cool1 acc1
+
+  run codex-rotate cooldown cool1
+  assert_success
+  run codex-rotate list
+  assert_success
+  assert_output_contains "cool1"
+  assert_output_contains "COOLDOWN"
+}
+
+@test "uncooldown clears cooldown and account becomes available" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account cool2 acc2
+
+  run codex-rotate cooldown cool2 --hours 2
+  assert_success
+  run codex-rotate uncooldown cool2
+  assert_success
+  run codex-rotate list
+  assert_success
+  assert_output_contains "cool2"
+  assert_output_contains "AVAILABLE"
+}
+
+@test "cooldown --hours writes expected duration in state" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account timed acc3
+
+  run codex-rotate cooldown timed --hours 2
+  assert_success
+
+  run jq -r '.accounts.timed.cooldown_until' "$HOME/.codex-accounts/state.json"
+  assert_success
+  cooldown_until="$output"
+  now_ts="$(date +%s)"
+  remaining=$((cooldown_until - now_ts))
+  (( remaining >= 7100 ))
+  (( remaining <= 7200 ))
+}
+
+@test "switch to cooled-down account fails without force" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account blocked acc4
+
+  run codex-rotate cooldown blocked --hours 1
+  assert_success
+  run codex-rotate switch blocked
+  assert_failure
+  assert_output_contains "on cooldown"
+}
+
+@test "import three accounts then switch shows first as active" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account a1 acc1
+  _import_account a2 acc2
+  _import_account a3 acc3
+
+  run codex-rotate switch a1
+  assert_success
+  run codex-rotate list
+  assert_success
+  assert_output_contains "a1"
+  assert_output_contains "ACTIVE"
+}
+
+@test "get_next_available picks only non-cooled account" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account g1 acc1
+  _import_account g2 acc2
+  _import_account g3 acc3
+  run codex-rotate switch g1
+  assert_success
+  run codex-rotate cooldown g1 --hours 2
+  assert_success
+  run codex-rotate cooldown g2 --hours 2
+  assert_success
+
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\necho "successful exec"\n' > "$HOME/bin/codex"
+  chmod +x "$HOME/bin/codex"
+
+  run codex-rotate run exec "test"
+  assert_success
+  assert_output_contains "successful exec"
+  [[ "$(<"$HOME/.codex-accounts/active")" == "g3" ]]
+}
+
+@test "all accounts exhausted causes run failure" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account ex1 acc1
+  _import_account ex2 acc2
+  run codex-rotate switch ex1
+  assert_success
+  run codex-rotate cooldown ex1 --hours 2
+  assert_success
+  run codex-rotate cooldown ex2 --hours 2
+  assert_success
+
+  run codex-rotate run exec "test"
+  assert_failure
+  assert_output_contains "All accounts are on cooldown or unavailable"
+}
+
+@test "import switch verify end-to-end active file and symlink target" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account endtoend acc9
+
+  run codex-rotate switch endtoend
+  assert_success
+  [[ "$(<"$HOME/.codex-accounts/active")" == "endtoend" ]]
+  [[ -L "$HOME/.codex/auth.json" ]]
+  [[ "$(readlink "$HOME/.codex/auth.json")" == "$HOME/.codex-accounts/credentials/endtoend.json" ]]
+}
+
+@test "import multiple accounts list shows each alias and status markers" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account m1 acc1
+  _import_account m2 acc2
+  _import_account m3 acc3
+  run codex-rotate switch m2
+  assert_success
+
+  run codex-rotate list
+  assert_success
+  assert_output_contains "m1"
+  assert_output_contains "m2"
+  assert_output_contains "m3"
+  assert_output_contains "ACTIVE"
+  assert_output_contains "AVAILABLE"
+}
+
+@test "classify_cooldown heuristics apply daily cooldown duration" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account day1 acc1
+  _import_account day2 acc2
+  run codex-rotate switch day1
+  assert_success
+
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\nmarker="$HOME/fake-codex-first-hit"\nif [[ ! -f "$marker" ]]; then\n  : > "$marker"\n  echo "daily limit exceeded, try tomorrow" >&2\n  exit 1\nfi\necho "done"\n' > "$HOME/bin/codex"
+  chmod +x "$HOME/bin/codex"
+
+  run codex-rotate run exec "test"
+  assert_success
+  assert_output_contains "done"
+
+  run jq -r '.accounts.day1.cooldown_until' "$HOME/.codex-accounts/state.json"
+  assert_success
+  daily_until="$output"
+  now_ts="$(date +%s)"
+  remaining=$((daily_until - now_ts))
+  (( remaining >= 85000 ))
+  (( remaining <= 86400 ))
+}
+
+@test "classify_cooldown heuristics apply weekly cooldown duration" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  _import_account week1 acc1
+  _import_account week2 acc2
+  run codex-rotate switch week1
+  assert_success
+
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\nmarker="$HOME/fake-codex-first-hit"\nif [[ ! -f "$marker" ]]; then\n  : > "$marker"\n  echo "weekly rate limit reached" >&2\n  exit 1\nfi\necho "done"\n' > "$HOME/bin/codex"
+  chmod +x "$HOME/bin/codex"
+
+  run codex-rotate run exec "test"
+  assert_success
+  assert_output_contains "done"
+
+  run jq -r '.accounts.week1.cooldown_until' "$HOME/.codex-accounts/state.json"
+  assert_success
+  weekly_until="$output"
+  now_ts="$(date +%s)"
+  remaining=$((weekly_until - now_ts))
+  (( remaining >= 600000 ))
+  (( remaining <= 604800 ))
+}

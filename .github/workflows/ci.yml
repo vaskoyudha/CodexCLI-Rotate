@@ -53,3 +53,19 @@ jobs:
 
       - name: Verify installation
         run: codex-rotate help
+
+  macos-test:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install bash jq util-linux
+          brew install bats-core
+
+      - name: Run BATS tests with Homebrew Bash
+        run: |
+          export PATH="/opt/homebrew/opt/util-linux/bin:/opt/homebrew/bin:$PATH"
+          bats --tap test/codex-rotate.bats
