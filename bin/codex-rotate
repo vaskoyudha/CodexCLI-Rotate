@@ -38,7 +38,6 @@ fi
 
 CODEX_AUTH="${CODEX_DIR}/auth.json"
 CODEX_AUTH_BACKUP="${CODEX_DIR}/auth.json.backup"
-CODEX_CONFIG="${CODEX_DIR}/config.toml"
 
 DEFAULT_CODEX_BIN="/home/vascosera/.config/nvm/versions/node/v22.22.2/bin/codex"
 
@@ -59,7 +58,6 @@ GREEN="\033[32m"
 YELLOW="\033[33m"
 BLUE="\033[34m"
 WHITE="\033[37m"
-BOLD="\033[1m"
 RESET="\033[0m"
 
 log_info() {
@@ -302,11 +300,13 @@ set_account_state() {
   local value="$3"
 
   if [[ "${value}" =~ ^-?[0-9]+$ ]]; then
+    # shellcheck disable=SC2016
     write_state '.accounts[$alias][$field] = $value' \
       --arg alias "${alias}" \
       --arg field "${field}" \
       --argjson value "${value}"
   else
+    # shellcheck disable=SC2016
     write_state '.accounts[$alias][$field] = $value' \
       --arg alias "${alias}" \
       --arg field "${field}" \
@@ -316,6 +316,7 @@ set_account_state() {
 
 init_account_state_entry() {
   local alias="$1"
+  # shellcheck disable=SC2016
   write_state '.accounts[$alias] = {
       "cooldown_until": 0,
       "total_uses": 0,
@@ -327,6 +328,7 @@ init_account_state_entry() {
 
 delete_account_state_entry() {
   local alias="$1"
+  # shellcheck disable=SC2016
   write_state 'del(.accounts[$alias])' --arg alias "${alias}"
 }
 
