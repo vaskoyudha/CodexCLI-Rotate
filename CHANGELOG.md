@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] - 2025-04-05
+
+### Fixed
+- **Refresh preserves existing `id_token`** — when the OAuth refresh response omits `id_token`, the existing token is kept instead of being blanked (prevents losing email/plan/account-id claims)
+- **Quota error messages are specific** — network errors, auth failures (401/403), invalid JSON, and missing tokens now report distinct diagnostics instead of generic "token may be expired"
+- **Version consistency** — synced README demo banner, `SCRIPT_VERSION`, and `package.json` to 1.1.4
+
+### Added
+- Regression tests for: refresh without `id_token`, malformed JWTs, missing email claim, usage 401/403 auto-refresh retry, invalid usage JSON, and full `cmd_auto` path through `flock`
+
 ## [1.1.3] - 2025-04-05
 
 ### Fixed

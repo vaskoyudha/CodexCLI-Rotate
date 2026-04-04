@@ -670,18 +670,32 @@ ENDJSON
 
 @test "quota command runs without error for configured account" {
   _setup_account_with_jwt "myacct"
-  # Will fail to reach API but should not crash
+  # Mock curl to simulate a network error so test doesn't depend on real API
+  mkdir -p "$HOME/bin"
+  cat > "$HOME/bin/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+exit 7
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
   run codex-rotate quota myacct
   assert_success
   assert_output_contains "myacct"
   assert_output_contains "test@example.com"
 }
 
-@test "quota command shows warning when API unreachable" {
+@test "quota command shows specific warning when API unreachable" {
   _setup_account_with_jwt "myacct"
+  # Mock curl to simulate network failure (exit 7 = connection refused)
+  mkdir -p "$HOME/bin"
+  cat > "$HOME/bin/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+exit 7
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
   run codex-rotate quota myacct
   assert_success
-  assert_output_contains "Could not fetch usage data"
+  # Should show network-specific error, not generic "token may be expired"
+  assert_output_contains "Network error"
 }
 
 @test "quota command fails for non-existent alias" {
@@ -871,10 +885,10 @@ MOCKCURL
   assert_output_contains "resets in"
 }
 
-@test "help output reports version 1.1.3" {
+@test "help output reports version 1.1.4" {
   run codex-rotate help
   assert_success
-  assert_output_contains "1.1.3"
+  assert_output_contains "1.1.4"
 }
 
 # ---------------------------------------------------------------------------
@@ -979,4 +993,245 @@ MOCKCURL
   # After preflight, active should have switched to low_usage (20% < 80%)
   active_after="$(cat "$HOME/.codex-accounts/active")"
   [ "$active_after" = "low_usage" ]
+}
+
+# ---------------------------------------------------------------------------
+# Regression tests for Oracle v1.1.3 rejection — Issue 1: refresh id_token
+# ---------------------------------------------------------------------------
+
+@test "refresh preserves existing id_token when response omits it" {
+  _setup_account_with_jwt "preserveacct"
+  # Verify id_token exists before refresh
+  local orig_id_token
+  orig_id_token="$(jq -r '.tokens.id_token' "$HOME/.codex-accounts/credentials/preserveacct.json")"
+  [ -n "$orig_id_token" ]
+
+  # Mock curl: return refresh response WITHOUT id_token
+  mkdir -p "$HOME/bin"
+  cat > "$HOME/bin/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+cat <<'RESPONSE'
+{"access_token":"refreshed_access_token","refresh_token":"refreshed_refresh_token"}
+200
+RESPONSE
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
+
+  run codex-rotate refresh preserveacct
+  assert_success
+
+  # id_token must be preserved (not blanked)
+  local new_id_token
+  new_id_token="$(jq -r '.tokens.id_token' "$HOME/.codex-accounts/credentials/preserveacct.json")"
+  [ "$new_id_token" = "$orig_id_token" ]
+
+  # access_token must be updated
+  local new_access
+  new_access="$(jq -r '.tokens.access_token' "$HOME/.codex-accounts/credentials/preserveacct.json")"
+  [ "$new_access" = "refreshed_access_token" ]
+}
+
+# ---------------------------------------------------------------------------
+# Regression tests for Oracle v1.1.3 rejection — Issue 2: error specificity
+# ---------------------------------------------------------------------------
+
+@test "quota shows auth error on 401" {
+  _setup_account_with_jwt "authacct"
+  # Mock curl: return 401 on all attempts (refresh also fails)
+  mkdir -p "$HOME/bin"
+  cat > "$HOME/bin/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+printf '\n401\n'
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
+
+  run codex-rotate quota authacct
+  assert_success
+  assert_output_contains "Authentication failed"
+}
+
+@test "quota shows parse error on invalid JSON" {
+  _setup_account_with_jwt "parseacct"
+  # Mock curl: return 200 with invalid JSON body
+  mkdir -p "$HOME/bin"
+  cat > "$HOME/bin/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+printf 'this is not json\n200\n'
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
+
+  run codex-rotate quota parseacct
+  assert_success
+  assert_output_contains "invalid response"
+}
+
+@test "quota shows HTTP error for unexpected status codes" {
+  _setup_account_with_jwt "httpacct"
+  # Mock curl: return 500 server error
+  mkdir -p "$HOME/bin"
+  cat > "$HOME/bin/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+printf 'Internal Server Error\n500\n'
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
+
+  run codex-rotate quota httpacct
+  assert_success
+  assert_output_contains "HTTP 500"
+}
+
+# ---------------------------------------------------------------------------
+# Regression tests — malformed JWT / missing email
+# ---------------------------------------------------------------------------
+
+@test "email command handles malformed JWT gracefully" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  mkdir -p "$HOME/.codex-accounts/credentials"
+  # Create an account with a completely invalid id_token (not base64)
+  cat > "$HOME/.codex-accounts/credentials/badjwt.json" <<'ENDJSON'
+{
+  "auth_mode": "browser_login",
+  "tokens": {
+    "id_token": "not.a.valid.jwt.at.all",
+    "access_token": "fake_access",
+    "refresh_token": "fake_refresh"
+  }
+}
+ENDJSON
+  chmod 600 "$HOME/.codex-accounts/credentials/badjwt.json"
+  echo "badjwt" >> "$HOME/.codex-accounts/order"
+  echo "badjwt" > "$HOME/.codex-accounts/active"
+
+  run codex-rotate email badjwt
+  assert_success
+  # Should show unknown, not crash
+  assert_output_contains "unknown"
+}
+
+@test "email command handles missing email field in JWT" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  mkdir -p "$HOME/.codex-accounts/credentials"
+  # JWT with no email field: payload = {"sub":"user123","aud":"test"}
+  # base64url("{"sub":"user123","aud":"test"}") = eyJzdWIiOiJ1c2VyMTIzIiwiYXVkIjoidGVzdCJ9
+  local no_email_payload="eyJzdWIiOiJ1c2VyMTIzIiwiYXVkIjoidGVzdCJ9"
+  cat > "$HOME/.codex-accounts/credentials/noemail.json" <<ENDJSON
+{
+  "auth_mode": "browser_login",
+  "tokens": {
+    "id_token": "${_FAKE_JWT_HEADER}.${no_email_payload}.fakesig",
+    "access_token": "fake_access",
+    "refresh_token": "fake_refresh"
+  }
+}
+ENDJSON
+  chmod 600 "$HOME/.codex-accounts/credentials/noemail.json"
+  echo "noemail" >> "$HOME/.codex-accounts/order"
+  echo "noemail" > "$HOME/.codex-accounts/active"
+
+  run codex-rotate email noemail
+  assert_success
+  assert_output_contains "unknown"
+}
+
+@test "email command handles empty id_token" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  mkdir -p "$HOME/.codex-accounts/credentials"
+  cat > "$HOME/.codex-accounts/credentials/emptytoken.json" <<'ENDJSON'
+{
+  "auth_mode": "browser_login",
+  "tokens": {
+    "id_token": "",
+    "access_token": "fake_access",
+    "refresh_token": "fake_refresh"
+  }
+}
+ENDJSON
+  chmod 600 "$HOME/.codex-accounts/credentials/emptytoken.json"
+  echo "emptytoken" >> "$HOME/.codex-accounts/order"
+  echo "emptytoken" > "$HOME/.codex-accounts/active"
+
+  run codex-rotate email emptytoken
+  assert_success
+  assert_output_contains "unknown"
+}
+
+# ---------------------------------------------------------------------------
+# Regression tests — quota 401 auto-refresh retry path
+# ---------------------------------------------------------------------------
+
+@test "quota retries with refreshed token on 401" {
+  _setup_account_with_jwt "retryacct"
+  # Mock curl: first call returns 401, second returns new tokens (refresh),
+  # third call returns valid usage data
+  mkdir -p "$HOME/bin"
+  local call_counter="$HOME/.codex-accounts/.curl_call_count"
+  echo "0" > "$call_counter"
+  cat > "$HOME/bin/curl" <<MOCKCURL
+#!/usr/bin/env bash
+count=\$(cat "$call_counter")
+count=\$((count + 1))
+echo "\$count" > "$call_counter"
+
+if [ "\$count" -eq 1 ]; then
+  # First call: usage API returns 401
+  printf '\\n401\\n'
+  exit 0
+fi
+if [ "\$count" -eq 2 ]; then
+  # Second call: refresh token succeeds
+  printf '{"id_token":"${_FAKE_ID_TOKEN}","access_token":"new_access","refresh_token":"new_refresh"}\\n200\\n'
+  exit 0
+fi
+if [ "\$count" -eq 3 ]; then
+  # Third call: retry usage API succeeds
+  printf '{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":55,"limit_window_seconds":18000,"reset_at":9999999999},"secondary_window":{"used_percent":25,"limit_window_seconds":604800,"reset_at":9999999999}},"credits":{"has_credits":true,"unlimited":true,"balance":null}}\\n200\\n'
+  exit 0
+fi
+printf '\\n000\\n'
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
+
+  run codex-rotate quota retryacct
+  assert_success
+  assert_output_contains "55%"
+  assert_output_contains "25%"
+}
+
+# ---------------------------------------------------------------------------
+# Regression tests — full cmd_auto through flock (end-to-end)
+# ---------------------------------------------------------------------------
+
+@test "auto mode full path selects lowest-usage account via flock" {
+  _setup_two_accounts_with_different_tokens
+
+  # This test simulates what cmd_auto actually does:
+  # 1. Exports CODEX_ROTATE__QUOTA_AWARE=1
+  # 2. Calls with_lock which spawns a subprocess
+  # 3. Subprocess runs __internal_auto_preflight
+  # 4. load_config in subprocess picks up the env var
+  # 5. Rotation picks lowest-usage account
+
+  active_before="$(cat "$HOME/.codex-accounts/active")"
+  [ "$active_before" = "high_usage" ]
+
+  # Run auto — it will call codex (which is our fake) and do the preflight
+  export CODEX_ROTATE__QUOTA_AWARE=1
+  run codex-rotate auto -- echo test
+  assert_success
+
+  # After auto, should have switched to low_usage
+  active_after="$(cat "$HOME/.codex-accounts/active")"
+  [ "$active_after" = "low_usage" ]
+}
+
+@test "version in help matches 1.1.4" {
+  run codex-rotate help
+  assert_success
+  assert_output_contains "1.1.4"
 }

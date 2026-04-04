@@ -15,7 +15,7 @@ set -euo pipefail
 ###############################################################################
 
 SCRIPT_NAME="codex-rotate"
-SCRIPT_VERSION="1.1.3"
+SCRIPT_VERSION="1.1.4"
 
 HOME_DIR="${HOME:?HOME environment variable must be set}"
 ACCOUNTS_DIR="${HOME_DIR}/.codex-accounts"
@@ -525,7 +525,7 @@ get_best_quota_account() {
     fi
 
     usage_json="$(query_usage_api "${alias}" 2>/dev/null)"
-    if [[ -z "${usage_json}" ]]; then
+    if [[ -z "${usage_json}" || "${usage_json}" == ERROR:* ]]; then
       if [[ -z "${best_alias}" ]]; then
         best_alias="${alias}"
       fi
@@ -776,7 +776,14 @@ OPENAI_CLIENT_ID="app_EMoamEEZ73f0CkXaXp7hrann"
 query_usage_api() {
   # Query the OpenAI usage API for a given account.
   # Retries once with a token refresh on 401/403.
-  # Returns: raw JSON response or empty string on failure.
+  # On success: prints raw JSON response to stdout.
+  # On failure: prints "ERROR:<reason>" to stdout where reason is one of:
+  #   api_key   — account uses API key mode (no usage API)
+  #   no_token  — no access_token available
+  #   network   — curl failed (timeout, DNS, connection refused)
+  #   auth      — 401/403 even after token refresh
+  #   http_NNN  — unexpected HTTP status NNN
+  #   parse     — HTTP 200 but response is not valid JSON
   local alias="$1"
   local tokens access_token account_id
 
@@ -784,7 +791,7 @@ query_usage_api() {
 
   # API key mode — no usage API available
   if [[ "$(printf "%s" "${tokens}" | jq -r '.mode // empty')" == "api_key" ]]; then
-    printf ""
+    printf "ERROR:api_key"
     return 0
   fi
 
@@ -796,24 +803,38 @@ query_usage_api() {
     account_id="$(extract_account_id_from_token "${access_token}")"
   fi
 
-  [[ -n "${access_token}" ]] || { printf ""; return 0; }
+  if [[ -z "${access_token}" ]]; then
+    printf "ERROR:no_token"
+    return 0
+  fi
 
-  local response http_code attempt
+  local response http_code attempt curl_exit
   for attempt in 1 2; do
+    curl_exit=0
     response="$(curl -sS --max-time 10 \
       -H "Authorization: Bearer ${access_token}" \
       -H "User-Agent: codex-cli/1.0.0" \
       ${account_id:+-H "chatgpt-account-id: ${account_id}"} \
       -w "\n%{http_code}" \
-      "${OPENAI_USAGE_URL}" 2>/dev/null || true)"
+      "${OPENAI_USAGE_URL}" 2>/dev/null)" || curl_exit=$?
+
+    if [[ "${curl_exit}" -ne 0 || -z "${response}" ]]; then
+      printf "ERROR:network"
+      return 0
+    fi
 
     # Split response body and HTTP code
     http_code="$(printf "%s" "${response}" | tail -n1)"
     response="$(printf "%s" "${response}" | sed '$d')"
 
-    if [[ "${http_code}" == "200" ]] && printf "%s" "${response}" | jq -e '.' >/dev/null 2>&1; then
-      printf "%s" "${response}"
-      return 0
+    if [[ "${http_code}" == "200" ]]; then
+      if printf "%s" "${response}" | jq -e '.' >/dev/null 2>&1; then
+        printf "%s" "${response}"
+        return 0
+      else
+        printf "ERROR:parse"
+        return 0
+      fi
     fi
 
     # On 401/403, try refreshing the token and retry once
@@ -822,16 +843,26 @@ query_usage_api() {
         # Re-read tokens after refresh
         tokens="$(get_account_tokens "${alias}")"
         access_token="$(printf "%s" "${tokens}" | jq -r '.access_token // empty')"
-        [[ -n "${access_token}" ]] || break
+        if [[ -z "${access_token}" ]]; then
+          printf "ERROR:auth"
+          return 0
+        fi
       else
-        break
+        printf "ERROR:auth"
+        return 0
       fi
     else
-      break
+      # Second attempt still got 401/403, or non-auth error
+      if [[ "${http_code}" == "401" || "${http_code}" == "403" ]]; then
+        printf "ERROR:auth"
+      else
+        printf "ERROR:http_%s" "${http_code}"
+      fi
+      return 0
     fi
   done
 
-  printf ""
+  printf "ERROR:network"
 }
 
 refresh_account_token() {
@@ -883,6 +914,13 @@ refresh_account_token() {
   if [[ -z "${new_access_token}" ]]; then
     log_warn "Token refresh for '${alias}' returned no access_token"
     return 1
+  fi
+
+  # Preserve existing id_token if the refresh response did not include one
+  local existing_id_token
+  if [[ -z "${new_id_token}" ]]; then
+    existing_id_token="$(jq -r '.tokens.id_token // empty' "${cred_file}" 2>/dev/null || true)"
+    new_id_token="${existing_id_token}"
   fi
 
   # Update credential file — preserve existing fields, update tokens
@@ -1732,9 +1770,32 @@ cmd_quota() {
 
     usage_json="$(query_usage_api "${alias}")"
 
-    if [[ -z "${usage_json}" ]]; then
-      printf "  %b⚠ Could not fetch usage data (token may be expired — try: %s refresh %s)%b\n" \
-        "${YELLOW}" "${SCRIPT_NAME}" "${alias}" "${RESET}"
+    if [[ "${usage_json}" == ERROR:* ]]; then
+      local usage_error="${usage_json#ERROR:}"
+      case "${usage_error}" in
+        api_key)
+          printf "  %b⚠ Usage API not available for API-key accounts%b\n" "${YELLOW}" "${RESET}"
+          ;;
+        no_token)
+          printf "  %b⚠ No access token — try: %s refresh %s%b\n" "${YELLOW}" "${SCRIPT_NAME}" "${alias}" "${RESET}"
+          ;;
+        auth)
+          printf "  %b⚠ Authentication failed (401/403) — try: %s refresh %s%b\n" "${YELLOW}" "${SCRIPT_NAME}" "${alias}" "${RESET}"
+          ;;
+        network)
+          printf "  %b⚠ Network error — could not reach usage API (check internet connection)%b\n" "${YELLOW}" "${RESET}"
+          ;;
+        parse)
+          printf "  %b⚠ Received invalid response from usage API (not valid JSON)%b\n" "${YELLOW}" "${RESET}"
+          ;;
+        http_*)
+          local err_code="${usage_error#http_}"
+          printf "  %b⚠ Usage API returned HTTP %s — try again later%b\n" "${YELLOW}" "${err_code}" "${RESET}"
+          ;;
+        *)
+          printf "  %b⚠ Could not fetch usage data — try: %s refresh %s%b\n" "${YELLOW}" "${SCRIPT_NAME}" "${alias}" "${RESET}"
+          ;;
+      esac
       continue
     fi
 
