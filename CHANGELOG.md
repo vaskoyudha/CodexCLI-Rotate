@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2025-04-05
+
+### Fixed
+- **Smart rotation now works in `auto` mode** — `QUOTA_AWARE_ROTATION` flag was lost when `cmd_auto` spawned a subprocess via `flock`; the subprocess re-entered `load_config` which reset the flag to 0. Fixed by exporting `CODEX_ROTATE__QUOTA_AWARE=1` as an environment variable that survives the subprocess boundary.
+
+### Added
+- BATS test proving quota-aware auto selection picks the lowest-usage account (71 total tests)
+
 ## [1.1.2] - 2025-04-05
 
 ### Fixed

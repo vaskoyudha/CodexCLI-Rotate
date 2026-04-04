@@ -15,7 +15,7 @@ set -euo pipefail
 ###############################################################################
 
 SCRIPT_NAME="codex-rotate"
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.1.3"
 
 HOME_DIR="${HOME:?HOME environment variable must be set}"
 ACCOUNTS_DIR="${HOME_DIR}/.codex-accounts"
@@ -246,6 +246,13 @@ load_config() {
   if [[ -f "${CONFIG_FILE}" ]]; then
     # shellcheck disable=SC1090
     source "${CONFIG_FILE}"
+  fi
+  # Allow environment variable to override config for subprocess propagation.
+  # cmd_auto exports CODEX_ROTATE__QUOTA_AWARE=1 which must survive the
+  # with_lock subprocess boundary (flock spawns a new process that re-enters
+  # main→load_config, resetting QUOTA_AWARE_ROTATION from config.sh).
+  if [[ "${CODEX_ROTATE__QUOTA_AWARE:-}" == "1" ]]; then
+    QUOTA_AWARE_ROTATION=1
   fi
   resolve_codex_bin
 }
@@ -1574,8 +1581,11 @@ cmd_auto() {
   require_initialized
   load_config
 
-  # Enable quota-aware rotation for auto mode
+  # Enable quota-aware rotation for auto mode.
+  # Export as environment variable so it survives the with_lock subprocess
+  # (flock -c spawns a new process that re-enters main→load_config).
   QUOTA_AWARE_ROTATION=1
+  export CODEX_ROTATE__QUOTA_AWARE=1
 
   local lock_cmd
   lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_auto_preflight")

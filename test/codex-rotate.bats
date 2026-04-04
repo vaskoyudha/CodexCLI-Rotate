@@ -871,8 +871,112 @@ MOCKCURL
   assert_output_contains "resets in"
 }
 
-@test "help output reports version 1.1.2" {
+@test "help output reports version 1.1.3" {
   run codex-rotate help
   assert_success
-  assert_output_contains "1.1.2"
+  assert_output_contains "1.1.3"
+}
+
+# ---------------------------------------------------------------------------
+# Quota-aware auto rotation (env var propagation through subprocess)
+# ---------------------------------------------------------------------------
+
+_setup_two_accounts_with_different_tokens() {
+  # Create two accounts with distinct access tokens so the mock curl can
+  # return different usage percentages for each.
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  mkdir -p "$HOME/.codex-accounts/credentials"
+
+  # Account "high_usage" — access_token starts with "tok_high"
+  cat > "$HOME/.codex-accounts/credentials/high_usage.json" <<ENDJSON
+{
+  "auth_mode": "browser_login",
+  "tokens": {
+    "id_token": "${_FAKE_ID_TOKEN}",
+    "access_token": "tok_high_usage",
+    "refresh_token": "fake_refresh_token",
+    "account_id": "acct_high"
+  }
+}
+ENDJSON
+  chmod 600 "$HOME/.codex-accounts/credentials/high_usage.json"
+
+  # Account "low_usage" — access_token starts with "tok_low"
+  cat > "$HOME/.codex-accounts/credentials/low_usage.json" <<ENDJSON
+{
+  "auth_mode": "browser_login",
+  "tokens": {
+    "id_token": "${_FAKE_ID_TOKEN}",
+    "access_token": "tok_low_usage",
+    "refresh_token": "fake_refresh_token",
+    "account_id": "acct_low"
+  }
+}
+ENDJSON
+  chmod 600 "$HOME/.codex-accounts/credentials/low_usage.json"
+
+  # Order: high_usage first, low_usage second
+  printf "high_usage\nlow_usage\n" > "$HOME/.codex-accounts/order"
+  echo "high_usage" > "$HOME/.codex-accounts/active"
+
+  # Initialize state for both accounts with high_usage having an old last_used
+  # (well beyond ROTATION_INTERVAL=10800s so auto_preflight triggers rotation)
+  local state_file="$HOME/.codex-accounts/state.json"
+  local old_ts
+  old_ts="$(date -u -d '5 hours ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+           || date -u -v-5H '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+           || echo "2020-01-01T00:00:00Z")"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg old_ts "${old_ts}" \
+    '.accounts.high_usage = {"total_uses":5,"last_used":$old_ts,"cooldown_until":0,"rate_limit_hits":0,"last_rate_limit":""}
+     | .accounts.low_usage = {"total_uses":1,"last_used":"","cooldown_until":0,"rate_limit_hits":0,"last_rate_limit":""}' \
+    "${state_file}" > "${tmp}" && mv "${tmp}" "${state_file}"
+
+  # Mock curl: return 80% usage for high_usage, 20% for low_usage
+  # Note: curl receives "-H" "Authorization: Bearer tok_high_usage" as separate
+  # args, so we use wildcard matching (*tok_high_usage*) on each arg.
+  cat > "$HOME/bin/curl" <<'MOCKCURL'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ "${arg}" == *"tok_high_usage"* ]]; then
+    printf '%s\n' '{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":80,"limit_window_seconds":18000,"reset_at":"2099-01-01T00:00:00Z"},"secondary_window":{"used_percent":40,"limit_window_seconds":604800,"reset_at":"2099-01-01T00:00:00Z"}},"credits":{"has_credits":true,"unlimited":true,"balance":null}}'
+    printf '%s\n' '200'
+    exit 0
+  fi
+  if [[ "${arg}" == *"tok_low_usage"* ]]; then
+    printf '%s\n' '{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":18000,"reset_at":"2099-01-01T00:00:00Z"},"secondary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_at":"2099-01-01T00:00:00Z"}},"credits":{"has_credits":true,"unlimited":true,"balance":null}}'
+    printf '%s\n' '200'
+    exit 0
+  fi
+done
+printf '\n'
+printf '000\n'
+MOCKCURL
+  chmod +x "$HOME/bin/curl"
+
+  # Ensure the symlink exists for the active account
+  mkdir -p "$HOME/.codex"
+  ln -sf "$HOME/.codex-accounts/credentials/high_usage.json" "$HOME/.codex/auth.json"
+}
+
+@test "auto preflight with CODEX_ROTATE__QUOTA_AWARE=1 selects lowest-usage account" {
+  _setup_two_accounts_with_different_tokens
+
+  # Verify initial active is high_usage
+  active_before="$(cat "$HOME/.codex-accounts/active")"
+  [ "$active_before" = "high_usage" ]
+
+  # Run the internal auto preflight with the env var set — this is exactly
+  # what cmd_auto does when it calls with_lock (spawning a subprocess).
+  # The env var must survive load_config's sourcing of config.sh.
+  export CODEX_ROTATE__QUOTA_AWARE=1
+  run codex-rotate __internal_auto_preflight
+  assert_success
+
+  # After preflight, active should have switched to low_usage (20% < 80%)
+  active_after="$(cat "$HOME/.codex-accounts/active")"
+  [ "$active_after" = "low_usage" ]
 }
