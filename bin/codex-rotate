@@ -15,7 +15,7 @@ set -euo pipefail
 ###############################################################################
 
 SCRIPT_NAME="codex-rotate"
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
 HOME_DIR="${HOME:?HOME environment variable must be set}"
 ACCOUNTS_DIR="${HOME_DIR}/.codex-accounts"
@@ -48,6 +48,7 @@ DAILY_COOLDOWN=86400
 WEEKLY_COOLDOWN=604800
 MAX_RETRIES=3
 CODEX_BIN=""
+QUOTA_AWARE_ROTATION=0
 
 ###############################################################################
 # ANSI colors and output helpers
@@ -91,6 +92,7 @@ check_prerequisites() {
   command -v mktemp >/dev/null 2>&1 || die "mktemp is required but not installed"
   command -v date >/dev/null 2>&1 || die "date is required but not installed"
   command -v stat >/dev/null 2>&1 || die "stat is required but not installed"
+  command -v curl >/dev/null 2>&1 || log_warn "curl not found — quota/refresh features will be unavailable"
 
   if (( WARN_CODEX_HOME == 1 )); then
     log_warn "CODEX_HOME is set to '${CODEX_HOME}'. Using that location for auth.json/config.toml."
@@ -261,6 +263,7 @@ DAILY_COOLDOWN=86400           # Cooldown for daily rate limit (24 hours)
 WEEKLY_COOLDOWN=604800         # Cooldown for weekly rate limit (7 days)
 MAX_RETRIES=3                  # Max retries after rate limit before giving up
 CODEX_BIN=""                   # Override codex binary path (auto-detected if empty)
+QUOTA_AWARE_ROTATION=0         # Set to 1 to prefer lowest-usage account in 'auto' mode
 EOF
   mv -f "${tmp}" "${CONFIG_FILE}"
 }
@@ -423,6 +426,17 @@ cooldown_remaining() {
 }
 
 get_next_available() {
+  # If quota-aware rotation is enabled, try quota-based selection first
+  if (( QUOTA_AWARE_ROTATION == 1 )); then
+    local quota_pick
+    quota_pick="$(get_best_quota_account)"
+    if [[ -n "${quota_pick}" ]]; then
+      printf "%s" "${quota_pick}"
+      return 0
+    fi
+  fi
+
+  # Fallback: round-robin
   mapfile -t all_aliases < <(get_order)
   local total="${#all_aliases[@]}"
   (( total > 0 )) || {
@@ -473,6 +487,60 @@ get_next_with_fallback() {
     return 0
   done
   printf ""
+}
+
+get_best_quota_account() {
+  # Attempt to find the account with the lowest primary window usage.
+  # Falls back to round-robin if quota data is unavailable.
+  command -v curl >/dev/null 2>&1 || {
+    printf ""
+    return 0
+  }
+
+  mapfile -t all_aliases < <(get_order)
+  local total="${#all_aliases[@]}"
+  (( total > 0 )) || { printf ""; return 0; }
+
+  local best_alias="" best_pct=101
+  local alias tokens usage_json pct
+
+  for alias in "${all_aliases[@]}"; do
+    [[ -f "${CREDENTIALS_DIR}/${alias}.json" ]] || continue
+    is_on_cooldown "${alias}" && continue
+
+    tokens="$(get_account_tokens "${alias}")"
+    # Skip API key accounts (no usage API)
+    if [[ "$(printf "%s" "${tokens}" | jq -r '.mode // empty')" == "api_key" ]]; then
+      if [[ -z "${best_alias}" ]]; then
+        best_alias="${alias}"
+      fi
+      continue
+    fi
+
+    usage_json="$(query_usage_api "${alias}" 2>/dev/null)"
+    if [[ -z "${usage_json}" ]]; then
+      if [[ -z "${best_alias}" ]]; then
+        best_alias="${alias}"
+      fi
+      continue
+    fi
+
+    pct="$(parse_usage_percent "${usage_json}")"
+    pct="${pct%%.*}"
+    [[ "${pct}" =~ ^[0-9]+$ ]] || pct=0
+
+    # Skip accounts at 90%+ usage
+    if (( pct >= 90 )); then
+      continue
+    fi
+
+    if (( pct < best_pct )); then
+      best_pct="${pct}"
+      best_alias="${alias}"
+    fi
+  done
+
+  printf "%s" "${best_alias}"
 }
 
 ###############################################################################
@@ -618,6 +686,236 @@ extract_email_from_id_token() {
   }
 
   printf "%s" "${payload_json}" | jq -r '.email // empty' 2>/dev/null || true
+}
+
+extract_jwt_claims() {
+  # Decode the full JWT payload and return the raw JSON.
+  local token="$1"
+  [[ -n "${token}" ]] || { printf "{}"; return 0; }
+
+  local payload_b64 payload_json
+  payload_b64="${token#*.}"
+  payload_b64="${payload_b64%%.*}"
+  payload_json="$(decode_base64url "${payload_b64}")"
+  [[ -n "${payload_json}" ]] || { printf "{}"; return 0; }
+
+  # Validate it's parseable JSON
+  if printf "%s" "${payload_json}" | jq -e '.' >/dev/null 2>&1; then
+    printf "%s" "${payload_json}"
+  else
+    printf "{}"
+  fi
+}
+
+extract_plan_type() {
+  local token="$1"
+  local claims
+  claims="$(extract_jwt_claims "${token}")"
+  printf "%s" "${claims}" | jq -r '.["https://api.openai.com/auth"].chatgpt_plan_type // empty' 2>/dev/null || true
+}
+
+extract_account_id_from_token() {
+  local token="$1"
+  local claims
+  claims="$(extract_jwt_claims "${token}")"
+  printf "%s" "${claims}" | jq -r '.["https://api.openai.com/auth"].chatgpt_account_id // empty' 2>/dev/null || true
+}
+
+get_account_tokens() {
+  # Read tokens from an account's credential file.
+  local alias="$1"
+  local cred_file="${CREDENTIALS_DIR}/${alias}.json"
+  [[ -f "${cred_file}" ]] || { printf "{}"; return 0; }
+
+  # If .tokens exists and has at least an access_token, use browser login mode
+  if jq -e '.tokens.access_token // empty | length > 0' "${cred_file}" >/dev/null 2>&1; then
+    jq -r '.tokens // {}' "${cred_file}" 2>/dev/null || printf "{}"
+    return 0
+  fi
+
+  # Check if API key mode (no tokens)
+  if jq -e 'has("OPENAI_API_KEY")' "${cred_file}" >/dev/null 2>&1; then
+    printf '{"mode":"api_key"}'
+    return 0
+  fi
+
+  jq -r '.tokens // {}' "${cred_file}" 2>/dev/null || printf "{}"
+}
+
+get_account_email() {
+  local alias="$1"
+  local tokens id_token
+  tokens="$(get_account_tokens "${alias}")"
+  id_token="$(printf "%s" "${tokens}" | jq -r '.id_token // empty' 2>/dev/null || true)"
+  extract_email_from_id_token "${id_token}"
+}
+
+get_account_plan() {
+  local alias="$1"
+  local tokens id_token
+  tokens="$(get_account_tokens "${alias}")"
+  id_token="$(printf "%s" "${tokens}" | jq -r '.id_token // empty' 2>/dev/null || true)"
+  extract_plan_type "${id_token}"
+}
+
+###############################################################################
+# Usage/quota API helpers
+###############################################################################
+
+OPENAI_USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
+OPENAI_REFRESH_URL="https://auth.openai.com/oauth/token"
+OPENAI_CLIENT_ID="app_EMoamEEZ73f0CkXaXp7hrann"
+
+query_usage_api() {
+  # Query the OpenAI usage API for a given account.
+  # Returns: raw JSON response or empty string on failure.
+  local alias="$1"
+  local tokens access_token account_id
+
+  tokens="$(get_account_tokens "${alias}")"
+
+  # API key mode — no usage API available
+  if [[ "$(printf "%s" "${tokens}" | jq -r '.mode // empty')" == "api_key" ]]; then
+    printf ""
+    return 0
+  fi
+
+  access_token="$(printf "%s" "${tokens}" | jq -r '.access_token // empty')"
+  account_id="$(printf "%s" "${tokens}" | jq -r '.account_id // empty')"
+
+  [[ -n "${access_token}" ]] || { printf ""; return 0; }
+
+  local response http_code
+  response="$(curl -sS --max-time 10 \
+    -H "Authorization: Bearer ${access_token}" \
+    -H "User-Agent: codex-cli/1.0.0" \
+    ${account_id:+-H "chatgpt-account-id: ${account_id}"} \
+    -w "\n%{http_code}" \
+    "${OPENAI_USAGE_URL}" 2>/dev/null || true)"
+
+  # Split response body and HTTP code
+  http_code="$(printf "%s" "${response}" | tail -n1)"
+  response="$(printf "%s" "${response}" | sed '$d')"
+
+  if [[ "${http_code}" == "200" ]] && printf "%s" "${response}" | jq -e '.' >/dev/null 2>&1; then
+    printf "%s" "${response}"
+  else
+    printf ""
+  fi
+}
+
+refresh_account_token() {
+  # Refresh tokens for a given account using refresh_token.
+  # Updates the credential file in-place on success.
+  # Returns: 0 on success, 1 on failure.
+  local alias="$1"
+  local cred_file="${CREDENTIALS_DIR}/${alias}.json"
+  [[ -f "${cred_file}" ]] || return 1
+
+  local tokens refresh_token
+  tokens="$(get_account_tokens "${alias}")"
+
+  if [[ "$(printf "%s" "${tokens}" | jq -r '.mode // empty')" == "api_key" ]]; then
+    log_warn "Account '${alias}' uses API key mode — token refresh not applicable"
+    return 1
+  fi
+
+  refresh_token="$(printf "%s" "${tokens}" | jq -r '.refresh_token // empty')"
+  [[ -n "${refresh_token}" ]] || {
+    log_warn "Account '${alias}' has no refresh_token"
+    return 1
+  }
+
+  local response http_code
+  response="$(curl -sS --max-time 15 \
+    -X POST "${OPENAI_REFRESH_URL}" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=refresh_token&refresh_token=${refresh_token}&client_id=${OPENAI_CLIENT_ID}" \
+    -w "\n%{http_code}" \
+    2>/dev/null || true)"
+
+  http_code="$(printf "%s" "${response}" | tail -n1)"
+  response="$(printf "%s" "${response}" | sed '$d')"
+
+  if [[ "${http_code}" != "200" ]]; then
+    log_warn "Token refresh failed for '${alias}' (HTTP ${http_code})"
+    return 1
+  fi
+
+  # Validate response has tokens
+  local new_id_token new_access_token new_refresh_token
+  new_id_token="$(printf "%s" "${response}" | jq -r '.id_token // empty' 2>/dev/null || true)"
+  new_access_token="$(printf "%s" "${response}" | jq -r '.access_token // empty' 2>/dev/null || true)"
+  new_refresh_token="$(printf "%s" "${response}" | jq -r '.refresh_token // empty' 2>/dev/null || true)"
+
+  if [[ -z "${new_access_token}" ]]; then
+    log_warn "Token refresh for '${alias}' returned no access_token"
+    return 1
+  fi
+
+  # Update credential file — preserve existing fields, update tokens
+  local tmp_file
+  tmp_file="$(mktemp "${cred_file}.tmp.XXXXXX")"
+
+  if jq --arg id "${new_id_token}" \
+     --arg access "${new_access_token}" \
+     --arg refresh "${new_refresh_token:-${refresh_token}}" \
+     '.tokens.id_token = $id | .tokens.access_token = $access | .tokens.refresh_token = $refresh' \
+     "${cred_file}" > "${tmp_file}" 2>/dev/null; then
+    if jq -e '.' "${tmp_file}" >/dev/null 2>&1; then
+      chmod 600 "${tmp_file}"
+      mv -f "${tmp_file}" "${cred_file}"
+      return 0
+    fi
+  fi
+
+  rm -f "${tmp_file}"
+  log_warn "Failed to update credential file for '${alias}'"
+  return 1
+}
+
+parse_usage_percent() {
+  # Extract primary window used_percent from usage JSON.
+  local usage_json="$1"
+  [[ -n "${usage_json}" ]] || { printf "0"; return 0; }
+  local pct
+  pct="$(printf "%s" "${usage_json}" | jq -r '.rate_limit.primary_window.used_percent // 0' 2>/dev/null || true)"
+  [[ -n "${pct}" && "${pct}" != "null" ]] || pct="0"
+  printf "%s" "${pct}"
+}
+
+parse_usage_reset_at() {
+  # Extract primary window reset_at ISO timestamp from usage JSON.
+  local usage_json="$1"
+  [[ -n "${usage_json}" ]] || { printf ""; return 0; }
+  printf "%s" "${usage_json}" | jq -r '.rate_limit.primary_window.reset_at // empty' 2>/dev/null || true
+}
+
+format_usage_bar() {
+  # Render a text-based usage bar: [████████░░] 80%
+  local percent="$1"
+  local width="${2:-10}"
+  # Ensure percent is an integer
+  percent="${percent%%.*}"
+  [[ "${percent}" =~ ^[0-9]+$ ]] || percent=0
+  (( percent > 100 )) && percent=100
+
+  local filled=$(( percent * width / 100 ))
+  local empty=$(( width - filled ))
+
+  local bar=""
+  local i
+  for (( i=0; i<filled; i++ )); do bar+="█"; done
+  for (( i=0; i<empty; i++ )); do bar+="░"; done
+
+  local color="${GREEN}"
+  if (( percent >= 90 )); then
+    color="${RED}"
+  elif (( percent >= 70 )); then
+    color="${YELLOW}"
+  fi
+
+  printf "%b[%s]%b %3d%%" "${color}" "${bar}" "${RESET}" "${percent}"
 }
 
 ###############################################################################
@@ -871,15 +1169,17 @@ cmd_list() {
   local active
   active="$(get_active)"
 
-  printf "%-20s %-16s %-8s %-14s %-12s\n" "ALIAS" "STATUS" "USES" "LAST USED" "COOLDOWN"
-  printf "%-20s %-16s %-8s %-14s %-12s\n" "--------------------" "----------------" "--------" "--------------" "------------"
+  printf "%-15s %-25s %-16s %-6s %-10s %-10s %-8s\n" \
+    "ALIAS" "EMAIL" "STATUS" "USES" "PLAN" "LAST USED" "COOLDOWN"
+  printf "%-15s %-25s %-16s %-6s %-10s %-10s %-8s\n" \
+    "───────────────" "─────────────────────────" "────────────────" "──────" "──────────" "──────────" "────────"
 
   if (( ${#all_aliases[@]} == 0 )); then
-    printf "%-20s %-16s %-8s %-14s %-12s\n" "(none)" "-" "-" "-" "-"
+    printf "%-15s %-25s %-16s %-6s %-10s %-10s %-8s\n" "(none)" "-" "-" "-" "-" "-" "-"
     return 0
   fi
 
-  local alias status uses last_used last_epoch last_str cooldown_secs cooldown_str
+  local alias status uses last_used last_epoch last_str cooldown_secs cooldown_str email plan
   for alias in "${all_aliases[@]}"; do
     status="$(render_status_label "${alias}" "${active}")"
     uses="$(get_account_state "${alias}" "total_uses")"
@@ -888,14 +1188,22 @@ cmd_list() {
     last_epoch="$(iso_to_epoch "${last_used}")"
     last_str="$(format_time_ago "${last_epoch}")"
     cooldown_secs="$(cooldown_remaining "${alias}")"
+    email="$(get_account_email "${alias}")"
+    plan="$(get_account_plan "${alias}")"
+
+    # Truncate email for display
+    if [[ ${#email} -gt 24 ]]; then
+      email="${email:0:21}..."
+    fi
+
     if (( cooldown_secs > 0 )); then
-      cooldown_str="$(format_duration "${cooldown_secs}") left"
+      cooldown_str="$(format_duration "${cooldown_secs}")"
     else
       cooldown_str="-"
     fi
 
-    printf "%-20s %-16b %-8s %-14s %-12s\n" \
-      "${alias}" "${status}" "${uses}" "${last_str}" "${cooldown_str}"
+    printf "%-15s %-25s %-16b %-6s %-10s %-10s %-8s\n" \
+      "${alias}" "${email:-unknown}" "${status}" "${uses}" "${plan:-?}" "${last_str}" "${cooldown_str}"
   done
 }
 
@@ -951,25 +1259,28 @@ cmd_status() {
   local active
   active="$(get_active)"
 
-  printf "╔══════════════════════════════════════════════════════════╗\n"
-  printf "║           Codex Account Rotation Manager                 ║\n"
-  printf "╠══════════════════════════════════════════════════════════╣\n"
-  printf "║  Account      │ Status      │ Uses │ Last Used │ CD Left ║\n"
-  printf "╠───────────────┼─────────────┼──────┼───────────┼─────────╣\n"
+  printf "\n"
+  printf "%b╔══════════════════════════════════════════════════════════════════════════════╗%b\n" "${BLUE}" "${RESET}"
+  printf "%b║              Codex Account Rotation Manager v%-6s                          ║%b\n" "${BLUE}" "${SCRIPT_VERSION}" "${RESET}"
+  printf "%b╠══════════════════════════════════════════════════════════════════════════════╣%b\n" "${BLUE}" "${RESET}"
 
   local available_count=0
-  local alias marker status uses last_used last_epoch ago cd_secs cd_left
+  local total_accounts="${#all_aliases[@]}"
 
-  if (( ${#all_aliases[@]} == 0 )); then
-    printf "║  (no accounts configured)                               ║\n"
+  if (( total_accounts == 0 )); then
+    printf "%b║  (no accounts configured)                                                  ║%b\n" "${BLUE}" "${RESET}"
   else
     for alias in "${all_aliases[@]}"; do
+      local marker email plan status uses last_used last_epoch ago cd_secs cd_left
+
       if [[ "${alias}" == "${active}" ]]; then
         marker="▶"
       else
         marker=" "
       fi
 
+      email="$(get_account_email "${alias}")"
+      plan="$(get_account_plan "${alias}")"
       status="$(render_status_label "${alias}" "${active}")"
       uses="$(get_account_state "${alias}" "total_uses")"
       uses="${uses:-0}"
@@ -987,17 +1298,18 @@ cmd_status() {
         ((available_count+=1))
       fi
 
-      printf "║ %s %-12.12s │ %-11b │ %4s │ %-9.9s │ %-7.7s ║\n" \
-        "${marker}" "${alias}" "${status}" "${uses}" "${ago}" "${cd_left}"
+      printf " %s %-12.12s  %-24.24s  %-8.8s  %-11b  %4s  %-8.8s  %-7.7s\n" \
+        "${marker}" "${alias}" "${email:-unknown}" "${plan:-?}" "${status}" "${uses}" "${ago}" "${cd_left}"
     done
   fi
 
-  printf "╠══════════════════════════════════════════════════════════╣\n"
-  printf "║  Rotation: %-4s │ Accounts: %-2s │ Available: %-2s          ║\n" \
-    "$(format_duration "${ROTATION_INTERVAL}")" "${#all_aliases[@]}" "${available_count}"
-  printf "║  Cooldowns: hourly=%s daily=%s weekly=%s          ║\n" \
-    "$(format_duration "${HOURLY_COOLDOWN}")" "$(format_duration "${DAILY_COOLDOWN}")" "$(format_duration "${WEEKLY_COOLDOWN}")"
-  printf "╚══════════════════════════════════════════════════════════╝\n"
+  printf "%b╠══════════════════════════════════════════════════════════════════════════════╣%b\n" "${BLUE}" "${RESET}"
+  printf "%b║  Rotation: %-6s  Accounts: %-3s  Available: %-3s                              ║%b\n" \
+    "${BLUE}" "$(format_duration "${ROTATION_INTERVAL}")" "${total_accounts}" "${available_count}" "${RESET}"
+  printf "%b║  Cooldowns: hourly=%-5s daily=%-6s weekly=%-6s                          ║%b\n" \
+    "${BLUE}" "$(format_duration "${HOURLY_COOLDOWN}")" "$(format_duration "${DAILY_COOLDOWN}")" "$(format_duration "${WEEKLY_COOLDOWN}")" "${RESET}"
+  printf "%b╚══════════════════════════════════════════════════════════════════════════════╝%b\n" "${BLUE}" "${RESET}"
+  printf "\n"
 }
 
 ensure_active_ready() {
@@ -1216,6 +1528,9 @@ cmd_auto() {
   require_initialized
   load_config
 
+  # Enable quota-aware rotation for auto mode
+  QUOTA_AWARE_ROTATION=1
+
   local lock_cmd
   lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_auto_preflight")
   with_lock "${lock_cmd}"
@@ -1327,6 +1642,159 @@ internal_uncooldown() {
   set_account_state "${alias}" "cooldown_until" "0"
 }
 
+cmd_quota() {
+  require_initialized
+  load_config
+
+  command -v curl >/dev/null 2>&1 || die "curl is required for quota checking"
+
+  local aliases_to_check=()
+
+  if (( $# > 0 )); then
+    local alias="$1"
+    validate_alias "${alias}" || die "Invalid alias '${alias}'."
+    account_exists "${alias}" || die "Alias '${alias}' not found"
+    aliases_to_check=("${alias}")
+  else
+    mapfile -t aliases_to_check < <(get_order)
+  fi
+
+  if (( ${#aliases_to_check[@]} == 0 )); then
+    die "No accounts configured. Use '${SCRIPT_NAME} add' first."
+  fi
+
+  local alias email plan usage_json primary_pct primary_reset secondary_pct secondary_reset
+  local credits_balance credits_unlimited plan_type_from_api
+
+  for alias in "${aliases_to_check[@]}"; do
+    email="$(get_account_email "${alias}")"
+    plan="$(get_account_plan "${alias}")"
+
+    printf "\n%b━━━ %s ━━━%b\n" "${BLUE}" "${alias}" "${RESET}"
+    printf "  Email:  %s\n" "${email:-unknown}"
+    printf "  Plan:   %s\n" "${plan:-unknown}"
+
+    usage_json="$(query_usage_api "${alias}")"
+
+    if [[ -z "${usage_json}" ]]; then
+      printf "  %b⚠ Could not fetch usage data (token may be expired — try: %s refresh %s)%b\n" \
+        "${YELLOW}" "${SCRIPT_NAME}" "${alias}" "${RESET}"
+      continue
+    fi
+
+    plan_type_from_api="$(printf "%s" "${usage_json}" | jq -r '.plan_type // empty' 2>/dev/null || true)"
+    [[ -n "${plan_type_from_api}" ]] && printf "  Plan (API): %s\n" "${plan_type_from_api}"
+
+    # Primary window (5-hour)
+    primary_pct="$(printf "%s" "${usage_json}" | jq -r '.rate_limit.primary_window.used_percent // 0' 2>/dev/null || true)"
+    primary_reset="$(printf "%s" "${usage_json}" | jq -r '.rate_limit.primary_window.reset_at // empty' 2>/dev/null || true)"
+
+    printf "  5-Hour Usage:  "
+    format_usage_bar "${primary_pct}"
+    if [[ -n "${primary_reset}" ]]; then
+      local reset_epoch now_epoch_val remaining_secs
+      reset_epoch="$(date -d "${primary_reset}" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${primary_reset%%.*}" +%s 2>/dev/null || echo 0)"
+      now_epoch_val="$(now_epoch)"
+      if (( reset_epoch > now_epoch_val )); then
+        remaining_secs=$(( reset_epoch - now_epoch_val ))
+        printf " (resets in %s)" "$(format_duration "${remaining_secs}")"
+      fi
+    fi
+    printf "\n"
+
+    # Secondary window (weekly)
+    secondary_pct="$(printf "%s" "${usage_json}" | jq -r '.rate_limit.secondary_window.used_percent // 0' 2>/dev/null || true)"
+    secondary_reset="$(printf "%s" "${usage_json}" | jq -r '.rate_limit.secondary_window.reset_at // empty' 2>/dev/null || true)"
+
+    printf "  Weekly Usage:  "
+    format_usage_bar "${secondary_pct}"
+    if [[ -n "${secondary_reset}" ]]; then
+      local reset_epoch2 now_epoch_val2 remaining_secs2
+      reset_epoch2="$(date -d "${secondary_reset}" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${secondary_reset%%.*}" +%s 2>/dev/null || echo 0)"
+      now_epoch_val2="$(now_epoch)"
+      if (( reset_epoch2 > now_epoch_val2 )); then
+        remaining_secs2=$(( reset_epoch2 - now_epoch_val2 ))
+        printf " (resets in %s)" "$(format_duration "${remaining_secs2}")"
+      fi
+    fi
+    printf "\n"
+
+    # Credits
+    credits_balance="$(printf "%s" "${usage_json}" | jq -r '.credits.balance // empty' 2>/dev/null || true)"
+    credits_unlimited="$(printf "%s" "${usage_json}" | jq -r '.credits.unlimited // empty' 2>/dev/null || true)"
+    if [[ "${credits_unlimited}" == "true" ]]; then
+      printf "  Credits:  %b∞ Unlimited%b\n" "${GREEN}" "${RESET}"
+    elif [[ -n "${credits_balance}" && "${credits_balance}" != "null" ]]; then
+      printf "  Credits:  %s\n" "${credits_balance}"
+    fi
+  done
+  printf "\n"
+}
+
+cmd_email() {
+  require_initialized
+  load_config
+
+  local aliases_to_check=()
+
+  if (( $# > 0 )); then
+    local alias="$1"
+    validate_alias "${alias}" || die "Invalid alias '${alias}'."
+    account_exists "${alias}" || die "Alias '${alias}' not found"
+    aliases_to_check=("${alias}")
+  else
+    mapfile -t aliases_to_check < <(get_order)
+  fi
+
+  if (( ${#aliases_to_check[@]} == 0 )); then
+    die "No accounts configured. Use '${SCRIPT_NAME} add' first."
+  fi
+
+  printf "%-20s %-35s %-10s\n" "ALIAS" "EMAIL" "PLAN"
+  printf "%-20s %-35s %-10s\n" "--------------------" "-----------------------------------" "----------"
+
+  local alias email plan
+  for alias in "${aliases_to_check[@]}"; do
+    email="$(get_account_email "${alias}")"
+    plan="$(get_account_plan "${alias}")"
+    printf "%-20s %-35s %-10s\n" "${alias}" "${email:-unknown}" "${plan:-unknown}"
+  done
+}
+
+cmd_refresh() {
+  require_initialized
+  load_config
+
+  command -v curl >/dev/null 2>&1 || die "curl is required for token refresh"
+
+  local aliases_to_refresh=()
+
+  if (( $# > 0 )); then
+    local alias="$1"
+    validate_alias "${alias}" || die "Invalid alias '${alias}'."
+    account_exists "${alias}" || die "Alias '${alias}' not found"
+    aliases_to_refresh=("${alias}")
+  else
+    mapfile -t aliases_to_refresh < <(get_order)
+  fi
+
+  if (( ${#aliases_to_refresh[@]} == 0 )); then
+    die "No accounts configured. Use '${SCRIPT_NAME} add' first."
+  fi
+
+  local alias
+  for alias in "${aliases_to_refresh[@]}"; do
+    printf "Refreshing tokens for '%s'... " "${alias}"
+    if refresh_account_token "${alias}"; then
+      local email
+      email="$(get_account_email "${alias}")"
+      printf "%b✓%b (%s)\n" "${GREEN}" "${RESET}" "${email:-refreshed}"
+    else
+      printf "%b✗%b (failed)\n" "${RED}" "${RESET}"
+    fi
+  done
+}
+
 cmd_help() {
   cat <<EOF
 ${SCRIPT_NAME} v${SCRIPT_VERSION}
@@ -1369,6 +1837,15 @@ Commands:
 
   uncooldown <alias>
       Manually clear account cooldown.
+
+  quota [alias]
+      Show real-time usage/quota from OpenAI API for one or all accounts.
+
+  email [alias]
+      Display email and plan type extracted from account tokens.
+
+  refresh [alias]
+      Refresh access tokens using stored refresh_token.
 
   help
       Show this help.
@@ -1433,6 +1910,9 @@ main() {
     auto) cmd_auto "$@" ;;
     cooldown) cmd_cooldown "$@" ;;
     uncooldown) cmd_uncooldown "$@" ;;
+    quota) cmd_quota "$@" ;;
+    email) cmd_email "$@" ;;
+    refresh) cmd_refresh "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
       log_error "Unknown command: ${cmd}"
