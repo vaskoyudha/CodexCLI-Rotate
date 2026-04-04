@@ -171,13 +171,48 @@ path_hint() {
   case ":${PATH}:" in
     *":${HOME}/.local/bin:"*)
       log_success "${HOME}/.local/bin is already in PATH"
-      ;;
-    *)
-      log_warn "${HOME}/.local/bin is not in PATH"
-      printf "\nAdd this to your shell profile (~/.bashrc or ~/.zshrc):\n"
-      printf "  export PATH=\"\$HOME/.local/bin:\$PATH\"\n\n"
+      return 0
       ;;
   esac
+
+  log_warn "${HOME}/.local/bin is not in PATH"
+
+  # Detect current shell and suggest the correct profile file
+  local shell_name profile_file
+  shell_name="$(basename "${SHELL:-bash}")"
+
+  case "${shell_name}" in
+    zsh)
+      if [[ -f "${HOME}/.zshrc" ]]; then
+        profile_file=".zshrc"
+      else
+        profile_file=".zprofile"
+      fi
+      ;;
+    fish)
+      profile_file=".config/fish/config.fish"
+      ;;
+    *)
+      # bash and anything else
+      if [[ -f "${HOME}/.bashrc" ]]; then
+        profile_file=".bashrc"
+      elif [[ -f "${HOME}/.bash_profile" ]]; then
+        profile_file=".bash_profile"
+      else
+        profile_file=".profile"
+      fi
+      ;;
+  esac
+
+  printf "\nAdd this to ~/%s:\n" "${profile_file}"
+  if [[ "${shell_name}" == "fish" ]]; then
+    printf "  fish_add_path %s/.local/bin\n\n" "\$HOME"
+  else
+    printf "  export PATH=\"\$HOME/.local/bin:\$PATH\"\n\n"
+  fi
+
+  printf "Then reload your shell:\n"
+  printf "  source ~/%s\n\n" "${profile_file}"
 }
 
 print_summary() {
