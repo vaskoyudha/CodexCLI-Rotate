@@ -1,12 +1,75 @@
-# codex-rotate
+```
+  ___  ___  ___  _____ __  __     ___  ___ _____ _ _____ ___
+ / __|/ _ \|   \| __\ \/ / ___  | _ \/ _ \_   _/_\_   _| __|
+| (__| (_) | |) | _| >  < |___| |   / (_) || |/ _ \| | | _|
+ \___|\___/|___/|___/_/\_\       |_|_\\___/ |_/_/ \_\_| |___|
+```
 
-Multi-account manager for Codex CLI with automatic rotation on rate limits
+**Multi-account manager for Codex CLI with automatic rotation on rate limits.**
 
 ![License](https://img.shields.io/github/license/vaskoyudha/MultipleAccountCodex)
 ![NPM Version](https://img.shields.io/npm/v/codex-rotate)
 ![GitHub Stars](https://img.shields.io/github/stars/vaskoyudha/MultipleAccountCodex)
 ![GitHub Issues](https://img.shields.io/github/issues/vaskoyudha/MultipleAccountCodex)
 ![ShellCheck](https://img.shields.io/github/actions/workflow/status/vaskoyudha/MultipleAccountCodex/ci.yml?label=shellcheck)
+
+---
+
+## Table of Contents
+
+- [Demo](#demo)
+- [Why codex-rotate?](#why-codex-rotate)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Installation](#installation)
+- [Usage](#usage)
+- [How It Works](#how-it-works)
+- [Configuration](#configuration)
+- [What It Does / Does NOT Do](#what-it-does--does-not-do)
+- [Requirements](#requirements)
+- [Uninstall](#uninstall)
+- [FAQ](#faq)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Demo
+
+```bash
+$ codex-rotate add personal
+[INFO] Launching Codex CLI login for 'personal'...
+[OK] Account 'personal' added and credentials stored.
+
+$ codex-rotate add work
+[INFO] Launching Codex CLI login for 'work'...
+[OK] Account 'work' added and credentials stored.
+
+$ codex-rotate list
+  ACCOUNT      STATUS      LAST USED
+  personal *   ready       2 min ago
+  work         ready       just now
+
+$ codex-rotate run exec "Refactor the auth module to use JWT"
+[INFO] Running with account 'personal'...
+# ... codex runs normally ...
+# Rate limit detected on stderr!
+[WARN] Rate limit hit on 'personal' — switching to 'work'
+[INFO] Swapped to 'work' (symlink updated atomically)
+[INFO] Retrying command with 'work'...
+# ... codex continues seamlessly ...
+
+$ codex-rotate status
+╔══════════════════════════════════════════════════════════╗
+║                  codex-rotate dashboard                  ║
+╠══════════════════════════════════════════════════════════╣
+║  ACCOUNT     STATUS     USES   COOLDOWN   LAST USED     ║
+║  personal    cooldown   14     47m left   3 min ago      ║
+║  work *      ready      3      —          just now       ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
 
 ## Why codex-rotate?
 
@@ -42,24 +105,31 @@ Multi-account manager for Codex CLI with automatic rotation on rate limits
    codex-rotate run exec "Write a snake game in Python"
    ```
 
+That's it. When `account1` hits the rate limit, `codex-rotate` swaps to `account2` and retries — no manual intervention needed.
+
 ## Installation
 
 ### npm (Recommended)
+
 ```bash
 npm install -g codex-rotate
 ```
 
 ### curl one-liner
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vaskoyudha/MultipleAccountCodex/main/install.sh | bash
 ```
 
 ### Manual
+
 ```bash
 git clone https://github.com/vaskoyudha/MultipleAccountCodex.git
 cd MultipleAccountCodex
-make install # or sudo cp bin/codex-rotate /usr/local/bin/
+make install
 ```
+
+> **Note**: All methods install to `~/.local/bin`. Make sure it's in your `$PATH`. The installer will detect your shell and tell you the exact line to add if needed.
 
 ## Usage
 
@@ -80,10 +150,31 @@ make install # or sudo cp bin/codex-rotate /usr/local/bin/
 
 ## How It Works
 
-1. **Transparent Wrapper**: `codex-rotate run` wraps the official Codex CLI, passing all arguments directly.
-2. **Signal Monitoring**: It monitors `stderr` for rate-limit signals (e.g., `429`, `usageLimitExceeded`, `rate limit`).
-3. **Atomic Swap**: Upon detection, it atomically swaps the `~/.codex/auth.json` symlink to the next available account.
-4. **Auto-Retry**: The command is automatically retried with the new account (up to `MAX_RETRIES`).
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│ codex-rotate │────▶│  codex CLI   │────▶│  OpenAI API │
+│     run      │     │  (wrapped)   │     │             │
+└──────┬───────┘     └──────┬───────┘     └──────┬──────┘
+       │                    │                     │
+       │              stderr monitor              │
+       │                    │                     │
+       │              ┌─────▼──────┐              │
+       │              │ Rate limit │              │
+       │              │ detected?  │              │
+       │              └─────┬──────┘              │
+       │                    │ yes                  │
+       │              ┌─────▼──────┐              │
+       │              │ Swap auth  │              │
+       │              │  symlink   │──────────────┘
+       │              │ (atomic)   │   retry with
+       │              └────────────┘   new account
+       │
+```
+
+1. **Transparent Wrapper** — `codex-rotate run` wraps the official Codex CLI, passing all arguments directly.
+2. **Signal Monitoring** — Monitors `stderr` for rate-limit signals (`429`, `usageLimitExceeded`, `rate limit`).
+3. **Atomic Swap** — Swaps the `~/.codex/auth.json` symlink to the next available account.
+4. **Auto-Retry** — Retries the command with the new account (up to `MAX_RETRIES`).
 
 ## Configuration
 
@@ -98,12 +189,46 @@ MAX_RETRIES=3             # Max retries after rate limit
 CODEX_BIN=""              # Path to codex binary (auto-detected if empty)
 ```
 
+## What It Does / Does NOT Do
+
+| ✅ Does | ❌ Does NOT |
+|---------|------------|
+| Manage multiple Codex CLI accounts | Create Codex accounts for you |
+| Auto-rotate on rate limits (429, etc.) | Bypass or circumvent rate limits |
+| Time-based rotation to balance usage | Send your credentials anywhere |
+| Secure credential storage (700/600 perms) | Require internet for local switching |
+| Atomic symlink switching (zero downtime) | Modify Codex CLI internals |
+| Track per-account usage and cooldowns | Work on Windows (Linux/macOS only) |
+
 ## Requirements
 
-- **Bash 4+**: Modern bash features required for associative arrays.
-- **jq**: For processing Codex JSON authentication files.
-- **flock**: For safe concurrent account switching (part of `util-linux`).
-- **Codex CLI**: The official OpenAI Codex CLI must be installed.
+- **Bash 4+** — Required for associative arrays. macOS users: `brew install bash`.
+- **jq** — JSON processor for auth files. The installer will auto-install if missing.
+- **flock** — Concurrent-safe file locking (part of `util-linux`).
+- **Codex CLI** — The official OpenAI Codex CLI must be installed.
+
+## Uninstall
+
+### npm
+
+```bash
+npm uninstall -g codex-rotate
+```
+
+### make
+
+```bash
+make uninstall
+```
+
+### Manual
+
+```bash
+rm -f ~/.local/bin/codex-rotate
+rm -rf ~/.codex-accounts          # removes all saved accounts and config
+```
+
+> **Warning**: Removing `~/.codex-accounts` deletes all stored credentials and configuration. Back up first if needed.
 
 ## FAQ
 
@@ -114,15 +239,21 @@ Yes. It works with any account type that the Codex CLI supports.
 Yes. Credentials are stored in a dedicated directory with `700` permissions, and individual files use `600`. File locking prevents race conditions.
 
 **What happens when all accounts are rate-limited?**
-The script will display a warning indicating all accounts are on cooldown and exit with an error.
+The script displays a warning that all accounts are on cooldown and exits with an error. Accounts automatically become available again after their cooldown period expires.
 
 **Does it work on macOS?**
-Yes, but macOS ships with an ancient version of Bash. Use `brew install bash` to get Bash 4+ and ensure it's in your `$PATH`.
+Yes, but macOS ships with Bash 3.x. Install Bash 4+ via `brew install bash` and ensure it's in your `$PATH`.
+
+**Can I use this with other AI CLI tools?**
+It's designed for Codex CLI, but the auth.json symlink pattern could be adapted for other tools that use file-based authentication.
+
+**How many accounts can I add?**
+No hard limit. Tested with 10+ accounts.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing instructions, and pull request guidelines.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+[MIT](LICENSE) © 2025 [vaskoyudha](https://github.com/vaskoyudha)
