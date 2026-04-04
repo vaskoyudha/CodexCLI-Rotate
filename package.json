@@ -2,24 +2,44 @@
   "name": "codex-rotate",
   "version": "1.0.0",
   "description": "Multi-account manager for Codex CLI with automatic rotation on rate limits",
-  "author": "vaskoyudha",
+  "author": "Vasco Yudha Nodyatama Sera <vascoyudha1@gmail.com> (https://github.com/vaskoyudha)",
   "homepage": "https://github.com/vaskoyudha/MultipleAccountCodex",
   "bugs": "https://github.com/vaskoyudha/MultipleAccountCodex/issues",
   "repository": {
     "type": "git",
-    "url": "git://github.com/vaskoyudha/MultipleAccountCodex.git"
+    "url": "git+https://github.com/vaskoyudha/MultipleAccountCodex.git"
   },
-  "keywords": ["codex", "openai", "cli", "account-manager", "rate-limit", "rotation", "multi-account"],
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/vaskoyudha"
+  },
+  "keywords": [
+    "codex",
+    "openai",
+    "cli",
+    "account-manager",
+    "rate-limit",
+    "rotation",
+    "multi-account",
+    "bash",
+    "codex-cli"
+  ],
   "bin": {
     "codex-rotate": "bin/codex-rotate"
   },
   "files": [
     "bin/codex-rotate"
   ],
+  "scripts": {
+    "test": "make test",
+    "lint": "make lint"
+  },
   "preferGlobal": true,
-  "os": ["!win32"],
+  "os": [
+    "!win32"
+  ],
   "engines": {
-    "node": "*"
+    "node": ">=14"
   },
   "license": "MIT"
 }
