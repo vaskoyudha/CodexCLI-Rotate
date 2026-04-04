@@ -61,7 +61,7 @@ $ codex-rotate run exec "Refactor the auth module to use JWT"
 
 $ codex-rotate status
 ╔═══════════════════════════════════════════════════════════════════════════════════╗
-║              Codex Account Rotation Manager v1.1.0                               ║
+║              Codex Account Rotation Manager v1.1.1                               ║
 ╠═══════════════════════════════════════════════════════════════════════════════════╣
 ║  ACCOUNT     EMAIL                STATUS     USES   PLAN   COOLDOWN   LAST USED  ║
 ║  personal    user@gmail.com       cooldown   14     plus   47m left   3 min ago   ║

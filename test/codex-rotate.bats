@@ -870,3 +870,9 @@ MOCKCURL
   assert_output_contains "30%"
   assert_output_contains "resets in"
 }
+
+@test "help output reports version 1.1.1" {
+  run codex-rotate help
+  assert_success
+  assert_output_contains "1.1.1"
+}
