@@ -67,6 +67,26 @@ $ codex-rotate status
 ║  personal    cooldown   14     47m left   3 min ago      ║
 ║  work *      ready      3      —          just now       ║
 ╚══════════════════════════════════════════════════════════╝
+
+$ codex-rotate quota
+━━━ personal ━━━
+  Email:  user@gmail.com
+  Plan:   plus
+  5-Hour Usage:  [████░░░░░░] 40% (resets in 2h 15m)
+  Weekly Usage:  [██░░░░░░░░] 20% (resets in 5d 3h)
+  Credits:  ∞ Unlimited
+
+━━━ work ━━━
+  Email:  work@company.com
+  Plan:   team
+  5-Hour Usage:  [█░░░░░░░░░] 10% (resets in 4h 30m)
+  Weekly Usage:  [░░░░░░░░░░]  0% (resets in 6d 22h)
+  Credits:  ∞ Unlimited
+
+$ codex-rotate email
+ALIAS                EMAIL                               PLAN
+personal             user@gmail.com                      plus
+work                 work@company.com                    team
 ```
 
 ---
@@ -82,9 +102,13 @@ $ codex-rotate status
 
 - 🔄 **Auto-rotation** — Detects `429`, `usageLimitExceeded`, and other rate-limit signals to instantly swap accounts.
 - ⏰ **Time-based rotation** — Optionally rotate accounts every N hours to balance usage across your fleet.
+- 📊 **Real-time quota checking** — Query OpenAI's usage API to see 5-hour and weekly usage with colored progress bars.
+- 📧 **Email & plan display** — Extract and show email addresses and plan types from account JWT tokens.
+- 🔃 **Token refresh** — Refresh expired access tokens using stored refresh tokens.
+- 🧠 **Quota-aware rotation** — Smart rotation in `auto` mode prefers accounts with the lowest usage percentage.
 - 🔒 **Secure storage** — Credentials stored in `~/.codex-accounts/` with strict `700`/`600` permissions.
 - ⚡ **Atomic switching** — Uses symlink swapping for `~/.codex/auth.json` to ensure zero-downtime transitions.
-- 📊 **Per-account tracking** — Built-in dashboard for usage counts, cooldown timers, and last-used timestamps.
+- 📈 **Per-account tracking** — Built-in dashboard for usage counts, cooldown timers, and last-used timestamps.
 - 🛡️ **Concurrent-safe** — Robust `flock`-based file locking prevents state corruption during parallel execution.
 
 ## Quick Start
@@ -144,6 +168,9 @@ make install
 | `status` | Show detailed dashboard | `codex-rotate status` |
 | `run` | Wrap command with rate-limit rotation | `codex-rotate run exec "prompt"` |
 | `auto` | Wrap with time + rate-limit rotation | `codex-rotate auto exec "prompt"` |
+| `quota` | Show real-time usage/quota from OpenAI | `codex-rotate quota` |
+| `email` | Display email and plan from tokens | `codex-rotate email` |
+| `refresh` | Refresh access tokens | `codex-rotate refresh my-acc` |
 | `cooldown` | Manually mark account as cooling down | `codex-rotate cooldown my-acc` |
 | `uncooldown` | Clear cooldown status for an account | `codex-rotate uncooldown my-acc` |
 | `help` | Display help information | `codex-rotate help` |
@@ -186,6 +213,7 @@ HOURLY_COOLDOWN=3600      # Cooldown for hourly rate limit (1 hour)
 DAILY_COOLDOWN=86400      # Cooldown for daily rate limit (24 hours)
 WEEKLY_COOLDOWN=604800    # Cooldown for weekly rate limit (7 days)
 MAX_RETRIES=3             # Max retries after rate limit
+QUOTA_AWARE_ROTATION=0    # Set to 1 for usage-based rotation (auto mode enables this)
 CODEX_BIN=""              # Path to codex binary (auto-detected if empty)
 ```
 
@@ -206,6 +234,7 @@ CODEX_BIN=""              # Path to codex binary (auto-detected if empty)
 
 - **Bash 4+** — Required for associative arrays. macOS users: `brew install bash`.
 - **jq** — JSON processor for auth files. The installer will auto-install if missing on Linux.
+- **curl** — Required for `quota`, `email`, and `refresh` commands (usually pre-installed).
 - **flock** — Concurrent-safe file locking (part of `util-linux`). macOS users: `brew install util-linux`.
 - **Codex CLI** — The official OpenAI Codex CLI must be installed.
 

@@ -587,3 +587,182 @@ _import_account() {
   (( remaining >= 600000 ))
   (( remaining <= 604800 ))
 }
+
+# ===========================================================================
+# v1.1.0 Feature Tests — JWT extraction, email, quota, refresh, enhanced list
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helper: create fake credentials with JWT tokens for testing
+# ---------------------------------------------------------------------------
+
+# A minimal JWT with email=test@example.com and chatgpt_plan_type=plus
+# Header: {"alg":"none","typ":"JWT"}
+# Payload: {"email":"test@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"plus","chatgpt_account_id":"acct_test123"}}
+_FAKE_JWT_HEADER="eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0"
+_FAKE_JWT_PAYLOAD="eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0MTIzIn19"
+_FAKE_ID_TOKEN="${_FAKE_JWT_HEADER}.${_FAKE_JWT_PAYLOAD}.fakesig"
+
+_setup_account_with_jwt() {
+  local alias="${1:-testacct}"
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  mkdir -p "$HOME/.codex-accounts/credentials"
+  cat > "$HOME/.codex-accounts/credentials/${alias}.json" <<ENDJSON
+{
+  "auth_mode": "browser_login",
+  "tokens": {
+    "id_token": "${_FAKE_ID_TOKEN}",
+    "access_token": "fake_access_token",
+    "refresh_token": "fake_refresh_token",
+    "account_id": "acct_test123"
+  }
+}
+ENDJSON
+  chmod 600 "$HOME/.codex-accounts/credentials/${alias}.json"
+  echo "${alias}" >> "$HOME/.codex-accounts/order"
+  echo "${alias}" > "$HOME/.codex-accounts/active"
+  # Initialize state entry
+  local state_file="$HOME/.codex-accounts/state.json"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg a "${alias}" '.accounts[$a] = {"total_uses":0,"last_used":"","cooldown_until":0,"rate_limit_hits":0,"last_rate_limit":""}' "${state_file}" > "${tmp}" && mv "${tmp}" "${state_file}"
+}
+
+# ---------------------------------------------------------------------------
+# Email command tests
+# ---------------------------------------------------------------------------
+
+@test "email command shows email from JWT" {
+  _setup_account_with_jwt "myacct"
+  run codex-rotate email myacct
+  assert_success
+  assert_output_contains "test@example.com"
+}
+
+@test "email command shows plan type from JWT" {
+  _setup_account_with_jwt "myacct"
+  run codex-rotate email myacct
+  assert_success
+  assert_output_contains "plus"
+}
+
+@test "email command without alias shows all accounts" {
+  _setup_account_with_jwt "acct1"
+  _setup_account_with_jwt "acct2"
+  run codex-rotate email
+  assert_success
+  assert_output_contains "acct1"
+  assert_output_contains "acct2"
+}
+
+@test "email command fails for non-existent alias" {
+  _install_fake_codex
+  run codex-rotate init
+  run codex-rotate email nonexistent
+  assert_failure
+}
+
+# ---------------------------------------------------------------------------
+# Quota command tests
+# ---------------------------------------------------------------------------
+
+@test "quota command runs without error for configured account" {
+  _setup_account_with_jwt "myacct"
+  # Will fail to reach API but should not crash
+  run codex-rotate quota myacct
+  assert_success
+  assert_output_contains "myacct"
+  assert_output_contains "test@example.com"
+}
+
+@test "quota command shows warning when API unreachable" {
+  _setup_account_with_jwt "myacct"
+  run codex-rotate quota myacct
+  assert_success
+  assert_output_contains "Could not fetch usage data"
+}
+
+@test "quota command fails for non-existent alias" {
+  _install_fake_codex
+  run codex-rotate init
+  run codex-rotate quota nonexistent
+  assert_failure
+}
+
+@test "quota without alias runs for all accounts" {
+  _setup_account_with_jwt "a1"
+  _setup_account_with_jwt "a2"
+  run codex-rotate quota
+  assert_success
+  assert_output_contains "a1"
+  assert_output_contains "a2"
+}
+
+# ---------------------------------------------------------------------------
+# Refresh command tests
+# ---------------------------------------------------------------------------
+
+@test "refresh command runs without crash" {
+  _setup_account_with_jwt "myacct"
+  # Will fail to reach API but should not crash
+  run codex-rotate refresh myacct
+  # Refresh will fail (no real API) but should exit 0 and show alias
+  assert_success
+  assert_output_contains "myacct"
+}
+
+@test "refresh command fails for non-existent alias" {
+  _install_fake_codex
+  run codex-rotate init
+  run codex-rotate refresh nonexistent
+  assert_failure
+}
+
+# ---------------------------------------------------------------------------
+# Enhanced list tests (email column)
+# ---------------------------------------------------------------------------
+
+@test "list shows email column header" {
+  _setup_account_with_jwt "myacct"
+  run codex-rotate list
+  assert_success
+  assert_output_contains "EMAIL"
+}
+
+@test "list shows account email" {
+  _setup_account_with_jwt "myacct"
+  run codex-rotate list
+  assert_success
+  assert_output_contains "test@example.com"
+}
+
+@test "list shows plan type" {
+  _setup_account_with_jwt "myacct"
+  run codex-rotate list
+  assert_success
+  assert_output_contains "plus"
+}
+
+# ---------------------------------------------------------------------------
+# Help text includes new commands
+# ---------------------------------------------------------------------------
+
+@test "help lists quota command" {
+  run codex-rotate help
+  assert_success
+  assert_output_contains "quota"
+}
+
+@test "help lists email command" {
+  run codex-rotate help
+  assert_success
+  assert_output_contains "email"
+}
+
+@test "help lists refresh command" {
+  run codex-rotate help
+  assert_success
+  assert_output_contains "refresh"
+}
