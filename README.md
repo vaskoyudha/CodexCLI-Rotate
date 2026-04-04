@@ -61,7 +61,7 @@ $ codex-rotate run exec "Refactor the auth module to use JWT"
 
 $ codex-rotate status
 ╔═══════════════════════════════════════════════════════════════════════════════════╗
-║              Codex Account Rotation Manager v1.1.4                               ║
+║              Codex Account Rotation Manager v1.1.5                               ║
 ╠═══════════════════════════════════════════════════════════════════════════════════╣
 ║  ACCOUNT     EMAIL                STATUS     USES   PLAN   COOLDOWN   LAST USED  ║
 ║  personal    user@gmail.com       cooldown   14     plus   47m left   3 min ago   ║
@@ -170,7 +170,7 @@ make install
 | `auto` | Wrap with time + rate-limit rotation | `codex-rotate auto exec "prompt"` |
 | `quota` | Show real-time usage/quota from OpenAI | `codex-rotate quota` |
 | `email` | Display email and plan from tokens | `codex-rotate email` |
-| `refresh` | Refresh access tokens | `codex-rotate refresh my-acc` |
+| `refresh` | Refresh access tokens | `codex-rotate refresh my-acc` or `codex-rotate refresh --all` |
 | `cooldown` | Manually mark account as cooling down | `codex-rotate cooldown my-acc` |
 | `uncooldown` | Clear cooldown status for an account | `codex-rotate uncooldown my-acc` |
 | `help` | Display help information | `codex-rotate help` |

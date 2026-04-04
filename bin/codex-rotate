@@ -15,7 +15,7 @@ set -euo pipefail
 ###############################################################################
 
 SCRIPT_NAME="codex-rotate"
-SCRIPT_VERSION="1.1.4"
+SCRIPT_VERSION="1.1.5"
 
 HOME_DIR="${HOME:?HOME environment variable must be set}"
 ACCOUNTS_DIR="${HOME_DIR}/.codex-accounts"
@@ -1886,12 +1886,13 @@ cmd_refresh() {
 
   local aliases_to_refresh=()
 
-  if (( $# > 0 )); then
+  if (( $# > 0 )) && [[ "$1" != "--all" ]]; then
     local alias="$1"
     validate_alias "${alias}" || die "Invalid alias '${alias}'."
     account_exists "${alias}" || die "Alias '${alias}' not found"
     aliases_to_refresh=("${alias}")
   else
+    # No args or --all: refresh all accounts
     mapfile -t aliases_to_refresh < <(get_order)
   fi
 
@@ -1963,8 +1964,9 @@ Commands:
   email [alias]
       Display email and plan type extracted from account tokens.
 
-  refresh [alias]
+  refresh [alias|--all]
       Refresh access tokens using stored refresh_token.
+      Without args or with --all, refreshes all accounts.
 
   help
       Show this help.

@@ -885,10 +885,10 @@ MOCKCURL
   assert_output_contains "resets in"
 }
 
-@test "help output reports version 1.1.4" {
+@test "help output reports version 1.1.5" {
   run codex-rotate help
   assert_success
-  assert_output_contains "1.1.4"
+  assert_output_contains "1.1.5"
 }
 
 # ---------------------------------------------------------------------------
@@ -1230,8 +1230,38 @@ MOCKCURL
   [ "$active_after" = "low_usage" ]
 }
 
-@test "version in help matches 1.1.4" {
+@test "version in help matches 1.1.5" {
   run codex-rotate help
   assert_success
-  assert_output_contains "1.1.4"
+  assert_output_contains "1.1.5"
+}
+
+# ---------------------------------------------------------------------------
+# refresh --all tests
+# ---------------------------------------------------------------------------
+
+@test "refresh --all refreshes all accounts with mocked API" {
+  _setup_account_with_jwt "acctA"
+  _setup_account_with_jwt "acctB"
+  _mock_curl_refresh_success
+  run codex-rotate refresh --all
+  assert_success
+  assert_output_contains "acctA"
+  assert_output_contains "acctB"
+}
+
+@test "refresh without args refreshes all accounts" {
+  _setup_account_with_jwt "acctX"
+  _setup_account_with_jwt "acctY"
+  _mock_curl_refresh_success
+  run codex-rotate refresh
+  assert_success
+  assert_output_contains "acctX"
+  assert_output_contains "acctY"
+}
+
+@test "help text documents refresh --all" {
+  run codex-rotate help
+  assert_success
+  assert_output_contains "refresh [alias|--all]"
 }
