@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_NAME="codex-rotate"
 SCRIPT_VERSION="1.0.0"
 
-HOME_DIR="${HOME:-/home/vascosera}"
+HOME_DIR="${HOME:?HOME environment variable must be set}"
 ACCOUNTS_DIR="${HOME_DIR}/.codex-accounts"
 CONFIG_FILE="${ACCOUNTS_DIR}/config.sh"
 STATE_FILE="${ACCOUNTS_DIR}/state.json"
@@ -39,7 +39,7 @@ fi
 CODEX_AUTH="${CODEX_DIR}/auth.json"
 CODEX_AUTH_BACKUP="${CODEX_DIR}/auth.json.backup"
 
-DEFAULT_CODEX_BIN="/home/vascosera/.config/nvm/versions/node/v22.22.2/bin/codex"
+DEFAULT_CODEX_BIN=""
 
 # Default config values (overridden by ~/.codex-accounts/config.sh)
 ROTATION_INTERVAL=10800
