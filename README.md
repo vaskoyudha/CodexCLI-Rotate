@@ -6,7 +6,7 @@ Multi-account manager for Codex CLI with automatic rotation on rate limits
 ![NPM Version](https://img.shields.io/npm/v/codex-rotate)
 ![GitHub Stars](https://img.shields.io/github/stars/vaskoyudha/MultipleAccountCodex)
 ![GitHub Issues](https://img.shields.io/github/issues/vaskoyudha/MultipleAccountCodex)
-![ShellCheck](https://img.shields.io/github/actions/workflow/status/vaskoyudha/MultipleAccountCodex/shellcheck.yml?label=shellcheck)
+![ShellCheck](https://img.shields.io/github/actions/workflow/status/vaskoyudha/MultipleAccountCodex/ci.yml?label=shellcheck)
 
 ## Why codex-rotate?
 

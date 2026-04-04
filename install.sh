@@ -105,9 +105,24 @@ check_flock() {
 }
 
 install_script() {
-  [[ -f "${SOURCE_SCRIPT}" ]] || die "Source script not found: ${SOURCE_SCRIPT}"
   mkdir -p "${INSTALL_DIR}"
-  cp -f "${SOURCE_SCRIPT}" "${TARGET_SCRIPT}"
+
+  if [[ "${SOURCE_MODE}" == "local" ]]; then
+    [[ -f "${SOURCE_SCRIPT}" ]] || die "Source script not found: ${SOURCE_SCRIPT}"
+    cp -f "${SOURCE_SCRIPT}" "${TARGET_SCRIPT}"
+  else
+    log_info "Downloading codex-rotate from ${REPO_URL}/bin/codex-rotate ..."
+    if have_cmd curl; then
+      curl -fsSL "${REPO_URL}/bin/codex-rotate" -o "${TARGET_SCRIPT}" \
+        || die "Download failed (curl)"
+    elif have_cmd wget; then
+      wget -qO "${TARGET_SCRIPT}" "${REPO_URL}/bin/codex-rotate" \
+        || die "Download failed (wget)"
+    else
+      die "Neither curl nor wget found. Install one and re-run."
+    fi
+  fi
+
   chmod +x "${TARGET_SCRIPT}"
   log_success "Installed codex-rotate to ${TARGET_SCRIPT}"
 }
@@ -127,6 +142,12 @@ offer_import_default() {
 
   if [[ -L "${auth_path}" ]]; then
     log_info "${auth_path} is already a symlink; skipping default import prompt."
+    return 0
+  fi
+
+  # Skip interactive prompt in non-interactive mode (CI, curl|bash without tty)
+  if [[ -n "${CODEX_ROTATE_NONINTERACTIVE:-}" ]] || [[ ! -t 0 ]]; then
+    log_info "Non-interactive mode: skipping default account import."
     return 0
   fi
 
