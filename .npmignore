@@ -11,3 +11,10 @@ SECURITY.md
 
 Makefile
 install.sh
+Formula/
+demo.tape
+demo.gif
+demo.mp4
+.sisyphus/
+
+!completions/

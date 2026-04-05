@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2025-04-05
+
+### Added
+- **`doctor` command** — System diagnostics checking Bash version, jq, curl, flock, Codex CLI, directory permissions, symlink health, account count, and token expiry
+- **`upgrade` command** — Self-update via npm with changelog preview
+- **`tui` command** — Interactive terminal menu via whiptail/dialog for navigating all features without memorizing commands
+- **`group` command** — Account grouping system (`group set/unset/list`) to tag accounts and scope rotation with `--group=<name>`
+- **`--json` output flag** — Machine-readable JSON output for `list`, `status`, `quota`, and `email` commands
+- **Notification system** — Desktop notifications (notify-send/osascript) and webhook alerts (Slack, Discord, Telegram, generic) triggered on account rotation events
+- **Shell completions** — Tab completion for bash, zsh, and fish with dynamic account alias completion
+- **Homebrew formula** — `brew tap vaskoyudha/tap && brew install codex-rotate`
+- **VHS demo tape** — Reproducible terminal recording script (`demo.tape`) for generating README demo GIFs
+- Config variables: `NOTIFY_DESKTOP`, `NOTIFY_WEBHOOK_URL`, `NOTIFY_WEBHOOK_TYPE`
+- `--group=<name>` flag for `run` and `auto` commands to rotate only within a group
+- `--group=<name>` flag for `add` command to assign group on creation
+- Makefile targets: `install-completions` for manual completion installation
+- 23 new BATS tests (107 total)
+
+### Changed
+- Features list in README expanded from 10 to 18 items
+- Usage command table includes all new commands
+- Makefile `install` target now also installs shell completions
+- Makefile `uninstall` target now also removes shell completions
+- `.npmignore` updated to include completions, exclude Formula and demo files
+
 ## [1.1.5] - 2025-04-05
 
 ### Fixed

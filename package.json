@@ -1,6 +1,6 @@
 {
   "name": "codex-rotate",
-  "version": "1.1.5",
+  "version": "1.2.0",
   "description": "Multi-account manager for Codex CLI with automatic rotation on rate limits",
   "author": "Vasco Yudha Nodyatama Sera <vascoyudha1@gmail.com> (https://github.com/vaskoyudha)",
   "homepage": "https://github.com/vaskoyudha/MultipleAccountCodex",
@@ -32,7 +32,8 @@
     "codex-rotate": "bin/codex-rotate"
   },
   "files": [
-    "bin/codex-rotate"
+    "bin/codex-rotate",
+    "completions/"
   ],
   "scripts": {
     "test": "make test",

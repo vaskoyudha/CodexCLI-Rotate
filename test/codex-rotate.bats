@@ -885,10 +885,10 @@ MOCKCURL
   assert_output_contains "resets in"
 }
 
-@test "help output reports version 1.1.5" {
+@test "help output reports version 1.2.0" {
   run codex-rotate help
   assert_success
-  assert_output_contains "1.1.5"
+  assert_output_contains "1.2.0"
 }
 
 # ---------------------------------------------------------------------------
@@ -1230,10 +1230,10 @@ MOCKCURL
   [ "$active_after" = "low_usage" ]
 }
 
-@test "version in help matches 1.1.5" {
+@test "version in help matches 1.2.0" {
   run codex-rotate help
   assert_success
-  assert_output_contains "1.1.5"
+  assert_output_contains "1.2.0"
 }
 
 # ---------------------------------------------------------------------------
@@ -1264,4 +1264,234 @@ MOCKCURL
   run codex-rotate help
   assert_success
   assert_output_contains "refresh [alias|--all]"
+}
+
+# ---------------------------------------------------------------------------
+# Doctor command
+# ---------------------------------------------------------------------------
+
+@test "doctor command exits without error when setup is valid" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  run codex-rotate doctor
+  # Should succeed or warn (no hard errors in test env)
+  [[ "$status" -eq 0 ]] || [[ "$output" == *"warning"* ]]
+}
+
+@test "doctor checks bash version" {
+  run codex-rotate doctor
+  assert_output_contains "Bash version"
+}
+
+@test "doctor checks jq dependency" {
+  run codex-rotate doctor
+  assert_output_contains "jq"
+}
+
+@test "doctor checks flock dependency" {
+  run codex-rotate doctor
+  assert_output_contains "flock"
+}
+
+@test "doctor checks curl dependency" {
+  run codex-rotate doctor
+  assert_output_contains "curl"
+}
+
+@test "doctor checks accounts directory" {
+  run codex-rotate init
+  assert_success
+  run codex-rotate doctor
+  assert_output_contains "Accounts directory"
+}
+
+@test "doctor reports account count" {
+  run codex-rotate init
+  assert_success
+  run codex-rotate doctor
+  assert_output_contains "Accounts configured"
+}
+
+# ---------------------------------------------------------------------------
+# Upgrade command
+# ---------------------------------------------------------------------------
+
+@test "upgrade command checks for npm" {
+  # If npm is available, it should at least start checking
+  if command -v npm >/dev/null 2>&1; then
+    run codex-rotate upgrade
+    # Should mention version check
+    assert_output_contains "version" || assert_output_contains "latest" || assert_output_contains "update"
+  else
+    run codex-rotate upgrade
+    assert_failure
+    assert_output_contains "npm"
+  fi
+}
+
+@test "help includes doctor command" {
+  run codex-rotate help
+  assert_output_contains "doctor"
+}
+
+@test "help includes upgrade command" {
+  run codex-rotate help
+  assert_output_contains "upgrade"
+}
+
+# ---------------------------------------------------------------------------
+# JSON output
+# ---------------------------------------------------------------------------
+
+@test "list --json outputs valid JSON" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  # Import a test account
+  local cred_file="$BATS_TMPDIR/test_auth.json"
+  printf '{"auth_mode":"login","tokens":{"access_token":"eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ0ZXN0Iiwic2NvcGUiOiJvcGVuaWQiLCJleHAiOjk5OTk5OTk5OTl9.fake","refresh_token":"rt_test","id_token":"eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ.fake","expires_at":9999999999}}' > "${cred_file}"
+  run codex-rotate import testjson "${cred_file}"
+  assert_success
+  run codex-rotate list --json
+  assert_success
+  # Validate it's parseable JSON
+  printf '%s' "$output" | jq . >/dev/null 2>&1
+  [[ $? -eq 0 ]]
+}
+
+@test "list --json contains alias field" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  local cred_file="$BATS_TMPDIR/test_auth2.json"
+  printf '{"auth_mode":"login","tokens":{"access_token":"eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ0ZXN0Iiwic2NvcGUiOiJvcGVuaWQiLCJleHAiOjk5OTk5OTk5OTl9.fake","refresh_token":"rt_test","id_token":"eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ.fake","expires_at":9999999999}}' > "${cred_file}"
+  run codex-rotate import testjson2 "${cred_file}"
+  assert_success
+  run codex-rotate list --json
+  assert_success
+  printf '%s' "$output" | jq -e '.[0].alias' >/dev/null 2>&1
+  [[ $? -eq 0 ]]
+}
+
+@test "email --json outputs valid JSON" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  local cred_file="$BATS_TMPDIR/test_auth3.json"
+  printf '{"auth_mode":"login","tokens":{"access_token":"eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ0ZXN0Iiwic2NvcGUiOiJvcGVuaWQiLCJleHAiOjk5OTk5OTk5OTl9.fake","refresh_token":"rt_test","id_token":"eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ.fake","expires_at":9999999999}}' > "${cred_file}"
+  run codex-rotate import testjson3 "${cred_file}"
+  assert_success
+  run codex-rotate email --json
+  assert_success
+  printf '%s' "$output" | jq . >/dev/null 2>&1
+  [[ $? -eq 0 ]]
+}
+
+@test "quota --json outputs valid JSON" {
+  _setup_account_with_jwt "jsonquota"
+  _mock_curl_usage_success
+  run codex-rotate quota --json
+  assert_success
+  printf '%s' "$output" | jq -e '.[0].alias and .[0].five_hour_usage_pct != null' >/dev/null 2>&1
+  [[ $? -eq 0 ]]
+}
+
+@test "status --json outputs valid JSON" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  run codex-rotate status --json
+  assert_success
+  printf '%s' "$output" | jq -e '.version' >/dev/null 2>&1
+  [[ $? -eq 0 ]]
+}
+
+# ---------------------------------------------------------------------------
+# TUI command
+# ---------------------------------------------------------------------------
+
+@test "tui command fails gracefully without whiptail/dialog" {
+  # Execute script directly with a PATH that excludes whiptail/dialog
+  local script_path="$BATS_TEST_DIRNAME/../bin/codex-rotate"
+  local tmpbin="$BATS_TMPDIR/no-tui-bin"
+  mkdir -p "${tmpbin}"
+  ln -sf "$(command -v jq)" "${tmpbin}/jq"
+  ln -sf "$(command -v flock)" "${tmpbin}/flock"
+  ln -sf "$(command -v mktemp)" "${tmpbin}/mktemp"
+  ln -sf "$(command -v date)" "${tmpbin}/date"
+  ln -sf "$(command -v stat)" "${tmpbin}/stat"
+  ln -sf "$(command -v curl)" "${tmpbin}/curl"
+  run env PATH="${tmpbin}" /usr/bin/bash "${script_path}" tui
+  # Should fail with meaningful error
+  assert_failure
+  assert_output_contains "whiptail" || assert_output_contains "dialog"
+}
+
+@test "help includes tui command" {
+  run codex-rotate help
+  assert_output_contains "tui"
+}
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+@test "config includes notification settings after init" {
+  run codex-rotate init
+  assert_success
+  run cat "$HOME/.codex-accounts/config.sh"
+  assert_output_contains "NOTIFY_DESKTOP"
+  assert_output_contains "NOTIFY_WEBHOOK_URL"
+}
+
+# ---------------------------------------------------------------------------
+# Account groups
+# ---------------------------------------------------------------------------
+
+@test "group list shows no groups initially" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  run codex-rotate group list
+  assert_success
+  assert_output_contains "No groups"
+}
+
+@test "group set assigns group to account" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  local cred="$BATS_TMPDIR/grp_auth.json"
+  printf '{"auth_mode":"login","tokens":{"access_token":"eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ0ZXN0IiwiZXhwIjo5OTk5OTk5OTk5fQ.fake","refresh_token":"rt","id_token":"","expires_at":9999999999}}' > "${cred}"
+  run codex-rotate import grptest "${cred}"
+  assert_success
+  run codex-rotate group set grptest work
+  assert_success
+  assert_output_contains "work"
+}
+
+@test "group list shows groups after set" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  local cred="$BATS_TMPDIR/grp_auth2.json"
+  printf '{"auth_mode":"login","tokens":{"access_token":"eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ0ZXN0IiwiZXhwIjo5OTk5OTk5OTk5fQ.fake","refresh_token":"rt","id_token":"","expires_at":9999999999}}' > "${cred}"
+  run codex-rotate import grptest2 "${cred}"
+  assert_success
+  run codex-rotate group set grptest2 personal
+  assert_success
+  run codex-rotate group list
+  assert_success
+  assert_output_contains "personal"
+}
+
+@test "help includes group command" {
+  run codex-rotate help
+  assert_output_contains "group"
+}
+
+@test "help includes notification config" {
+  run codex-rotate help
+  assert_output_contains "NOTIFY_DESKTOP" || assert_output_contains "Notification"
 }

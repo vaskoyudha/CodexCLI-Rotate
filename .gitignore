@@ -8,3 +8,5 @@ node_modules/
 *.log
 *.tgz
 test/tmp/
+demo.gif
+demo.mp4

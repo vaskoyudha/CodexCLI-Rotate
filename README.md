@@ -61,7 +61,7 @@ $ codex-rotate run exec "Refactor the auth module to use JWT"
 
 $ codex-rotate status
 ╔═══════════════════════════════════════════════════════════════════════════════════╗
-║              Codex Account Rotation Manager v1.1.5                               ║
+║              Codex Account Rotation Manager v1.2.0                               ║
 ╠═══════════════════════════════════════════════════════════════════════════════════╣
 ║  ACCOUNT     EMAIL                STATUS     USES   PLAN   COOLDOWN   LAST USED  ║
 ║  personal    user@gmail.com       cooldown   14     plus   47m left   3 min ago   ║
@@ -110,6 +110,14 @@ work                 work@company.com                    team
 - ⚡ **Atomic switching** — Uses symlink swapping for `~/.codex/auth.json` to ensure zero-downtime transitions.
 - 📈 **Per-account tracking** — Built-in dashboard for usage counts, cooldown timers, and last-used timestamps.
 - 🛡️ **Concurrent-safe** — Robust `flock`-based file locking prevents state corruption during parallel execution.
+- 🩺 **System diagnostics** — `doctor` command checks Bash version, dependencies, permissions, and token health.
+- 🖥️ **Interactive TUI** — Menu-driven interface via `whiptail` or `dialog` — no commands to memorize.
+- 📦 **JSON output** — `--json` flag on `list`, `status`, `quota`, `email` for scripting and automation.
+- 🏷️ **Account groups** — Tag accounts with groups and rotate only within a group (`--group=work`).
+- 🔔 **Notifications** — Desktop notifications and webhooks (Slack, Discord, Telegram) on rotation events.
+- ⬆️ **Self-upgrade** — `upgrade` command checks npm for the latest version and upgrades in-place.
+- 🐚 **Shell completions** — Tab completion for bash, zsh, and fish with dynamic account alias support.
+- 🍺 **Homebrew support** — Install via `brew install codex-rotate` (tap available).
 
 ## Quick Start
 
@@ -153,7 +161,14 @@ cd MultipleAccountCodex
 make install
 ```
 
-> **Note**: `npm install -g` installs to npm's global prefix (usually `/usr/local/bin`). The curl installer and `make install` install to `~/.local/bin` — make sure it's in your `$PATH`. The installer will detect your shell and tell you the exact line to add if needed.
+### Homebrew
+
+```bash
+brew tap vaskoyudha/tap
+brew install codex-rotate
+```
+
+> **Note**: `npm install -g` installs to npm's global prefix (usually `/usr/local/bin`). The curl installer and `make install` install to `~/.local/bin` — make sure it's in your `$PATH`. The installer will detect your shell and tell you the exact line to add if needed. Shell completions are installed automatically with `npm install -g` and `make install`.
 
 ## Usage
 
@@ -163,14 +178,18 @@ make install
 | `add` | Add account via browser login | `codex-rotate add my-acc` |
 | `import` | Import an existing `auth.json` | `codex-rotate import old-acc ./auth.json` |
 | `remove` | Remove an account from rotation | `codex-rotate remove my-acc` |
-| `list` | List accounts with simplified status | `codex-rotate list` |
+| `list` | List accounts with simplified status | `codex-rotate list` or `codex-rotate list --json` |
 | `switch` | Manually switch the active account | `codex-rotate switch my-acc` |
-| `status` | Show detailed dashboard | `codex-rotate status` |
+| `status` | Show detailed dashboard | `codex-rotate status` or `codex-rotate status --json` |
 | `run` | Wrap command with rate-limit rotation | `codex-rotate run exec "prompt"` |
 | `auto` | Wrap with time + rate-limit rotation | `codex-rotate auto exec "prompt"` |
-| `quota` | Show real-time usage/quota from OpenAI | `codex-rotate quota` |
-| `email` | Display email and plan from tokens | `codex-rotate email` |
+| `quota` | Show real-time usage/quota from OpenAI | `codex-rotate quota` or `codex-rotate quota --json` |
+| `email` | Display email and plan from tokens | `codex-rotate email` or `codex-rotate email --json` |
 | `refresh` | Refresh access tokens | `codex-rotate refresh my-acc` or `codex-rotate refresh --all` |
+| `doctor` | Run system diagnostics | `codex-rotate doctor` |
+| `upgrade` | Check for updates and upgrade via npm | `codex-rotate upgrade` |
+| `tui` | Interactive terminal menu | `codex-rotate tui` |
+| `group` | Manage account groups | `codex-rotate group set my-acc work` |
 | `cooldown` | Manually mark account as cooling down | `codex-rotate cooldown my-acc` |
 | `uncooldown` | Clear cooldown status for an account | `codex-rotate uncooldown my-acc` |
 | `help` | Display help information | `codex-rotate help` |
@@ -215,6 +234,109 @@ WEEKLY_COOLDOWN=604800    # Cooldown for weekly rate limit (7 days)
 MAX_RETRIES=3             # Max retries after rate limit
 QUOTA_AWARE_ROTATION=0    # Set to 1 for usage-based rotation (auto mode enables this)
 CODEX_BIN=""              # Path to codex binary (auto-detected if empty)
+NOTIFY_DESKTOP=0          # Set to 1 to enable desktop notifications on rotation
+NOTIFY_WEBHOOK_URL=""     # Webhook URL for Slack, Discord, or Telegram
+NOTIFY_WEBHOOK_TYPE=""    # Type: slack, discord, telegram, or generic
+```
+
+## Account Groups
+
+Tag accounts into groups and rotate only within a specific group:
+
+```bash
+codex-rotate group set personal-1 personal
+codex-rotate group set personal-2 personal
+codex-rotate group set work-1 work
+
+codex-rotate group list
+# GROUPS:
+#   personal       personal-1, personal-2
+#   work           work-1
+
+codex-rotate run --group=work exec "Refactor the API"
+codex-rotate auto --group=personal exec "Write tests"
+```
+
+## JSON Output
+
+All display commands support `--json` for scripting and automation:
+
+```bash
+codex-rotate list --json | jq '.[].alias'
+codex-rotate quota --json | jq '.[] | select(.five_hour_usage_pct > 80)'
+codex-rotate status --json | jq '.config'
+codex-rotate email --json | jq '.[].email'
+```
+
+## Notifications
+
+Enable desktop notifications and/or webhooks to get alerted when rotation happens:
+
+```bash
+# Desktop notifications (Linux: notify-send, macOS: osascript)
+# Set in ~/.codex-accounts/config.sh:
+NOTIFY_DESKTOP=1
+
+# Slack webhook
+NOTIFY_WEBHOOK_URL="https://hooks.slack.com/services/T.../B.../xxx"
+NOTIFY_WEBHOOK_TYPE="slack"
+
+# Discord webhook
+NOTIFY_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+NOTIFY_WEBHOOK_TYPE="discord"
+```
+
+## Interactive TUI
+
+Launch a menu-driven interface (requires `whiptail` or `dialog`):
+
+```bash
+codex-rotate tui
+```
+
+Navigate with arrow keys — list accounts, check quota, switch accounts, run diagnostics, all from a single menu.
+
+## Shell Completions
+
+Tab completion is installed automatically with `npm install -g` and `make install`. To install manually:
+
+**Bash** — add to `~/.bashrc`:
+```bash
+source /path/to/codex-rotate/completions/codex-rotate.bash
+```
+
+**Zsh** — add to `~/.zshrc`:
+```bash
+fpath=(/path/to/codex-rotate/completions $fpath)
+autoload -U compinit && compinit
+```
+
+**Fish** — copy to completions dir:
+```bash
+cp completions/codex-rotate.fish ~/.config/fish/completions/
+```
+
+## System Diagnostics
+
+Run `doctor` to verify your setup:
+
+```bash
+$ codex-rotate doctor
+codex-rotate v1.2.0 — System Diagnostics
+──────────────────────────────────────────────────
+
+  Bash version (≥ 4 required)            [✓] v5.1.16
+  jq (JSON processor)                    [✓] jq-1.6
+  curl (HTTP client)                     [✓] curl 7.81.0
+  flock (file locking)                   [✓] available
+  Codex CLI                              [✓] /usr/local/bin/codex
+  Accounts directory                     [✓] ~/.codex-accounts (700)
+  Credentials directory                  [✓] ~/.codex-accounts/credentials (700)
+  Auth symlink                           [✓] → ~/.codex-accounts/credentials/main.json
+  Accounts configured                    [✓] 3 account(s)
+  Active token health                    [✓] valid (expires in 2h 15m)
+
+✓ All systems operational.
 ```
 
 ## What It Does / Does NOT Do

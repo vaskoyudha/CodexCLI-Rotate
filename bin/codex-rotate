@@ -15,7 +15,7 @@ set -euo pipefail
 ###############################################################################
 
 SCRIPT_NAME="codex-rotate"
-SCRIPT_VERSION="1.1.5"
+SCRIPT_VERSION="1.2.0"
 
 HOME_DIR="${HOME:?HOME environment variable must be set}"
 ACCOUNTS_DIR="${HOME_DIR}/.codex-accounts"
@@ -49,6 +49,9 @@ WEEKLY_COOLDOWN=604800
 MAX_RETRIES=3
 CODEX_BIN=""
 QUOTA_AWARE_ROTATION=0
+NOTIFY_DESKTOP=0
+NOTIFY_WEBHOOK_URL=""
+NOTIFY_WEBHOOK_TYPE=""
 
 ###############################################################################
 # ANSI colors and output helpers
@@ -143,6 +146,40 @@ require_initialized() {
 ###############################################################################
 
 with_lock() { flock -x "${LOCK_FILE}" -c "$1"; }
+
+send_notification() {
+  local title="$1"
+  local message="$2"
+
+  # Desktop notification
+  if [[ "${NOTIFY_DESKTOP}" -eq 1 ]]; then
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send "${title}" "${message}" 2>/dev/null || true
+    elif command -v osascript >/dev/null 2>&1; then
+      osascript -e "display notification \"${message}\" with title \"${title}\"" 2>/dev/null || true
+    fi
+  fi
+
+  # Webhook notification
+  if [[ -n "${NOTIFY_WEBHOOK_URL}" ]]; then
+    local payload=""
+    case "${NOTIFY_WEBHOOK_TYPE}" in
+      slack)
+        payload="$(jq -nc --arg text "${title}: ${message}" '{"text": $text}')"
+        ;;
+      discord)
+        payload="$(jq -nc --arg content "${title}: ${message}" '{"content": $content}')"
+        ;;
+      telegram)
+        payload="$(jq -nc --arg text "${title}\n${message}" '{"text": $text}')"
+        ;;
+      *)
+        payload="$(jq -nc --arg title "${title}" --arg message "${message}" '{"title": $title, "message": $message}')"
+        ;;
+    esac
+    curl -fsSL -X POST -H "Content-Type: application/json" -d "${payload}" "${NOTIFY_WEBHOOK_URL}" >/dev/null 2>&1 || true
+  fi
+}
 
 ###############################################################################
 # Time helpers
@@ -271,6 +308,9 @@ WEEKLY_COOLDOWN=604800         # Cooldown for weekly rate limit (7 days)
 MAX_RETRIES=3                  # Max retries after rate limit before giving up
 CODEX_BIN=""                   # Override codex binary path (auto-detected if empty)
 QUOTA_AWARE_ROTATION=0         # Set to 1 to prefer lowest-usage account in 'auto' mode
+NOTIFY_DESKTOP=0               # Set to 1 to enable desktop notifications
+NOTIFY_WEBHOOK_URL=""          # Webhook URL (Slack, Discord, etc.)
+NOTIFY_WEBHOOK_TYPE=""         # Type: slack, discord, telegram, generic
 EOF
   mv -f "${tmp}" "${CONFIG_FILE}"
 }
@@ -326,20 +366,34 @@ set_account_state() {
 
 init_account_state_entry() {
   local alias="$1"
+  local group="${2:-}"
   # shellcheck disable=SC2016
   write_state '.accounts[$alias] = {
       "cooldown_until": 0,
       "total_uses": 0,
       "last_used": "",
       "rate_limit_hits": 0,
-      "last_rate_limit": ""
-    }' --arg alias "${alias}"
+      "last_rate_limit": "",
+      "group": $group
+    }' --arg alias "${alias}" --arg group "${group}"
 }
 
 delete_account_state_entry() {
   local alias="$1"
   # shellcheck disable=SC2016
   write_state 'del(.accounts[$alias])' --arg alias "${alias}"
+}
+
+get_account_group() {
+  local alias="$1"
+  jq -r --arg a "${alias}" '.accounts[$a].group // ""' "${STATE_FILE}" 2>/dev/null || echo ""
+}
+
+set_account_group() {
+  local alias="$1"
+  local group="$2"
+  local tmp="${STATE_FILE}.tmp.$$"
+  jq --arg a "${alias}" --arg g "${group}" '.accounts[$a].group = $g' "${STATE_FILE}" > "${tmp}" && mv "${tmp}" "${STATE_FILE}"
 }
 
 ###############################################################################
@@ -432,7 +486,23 @@ cooldown_remaining() {
   fi
 }
 
+clear_expired_cooldown_if_needed() {
+  local alias="$1"
+  local cooldown_until now
+  cooldown_until="$(get_account_state "${alias}" "cooldown_until")"
+  cooldown_until="${cooldown_until:-0}"
+  [[ "${cooldown_until}" =~ ^[0-9]+$ ]] || cooldown_until=0
+  now="$(now_epoch)"
+
+  if (( cooldown_until > 0 && cooldown_until <= now )); then
+    set_account_state "${alias}" "cooldown_until" "0"
+    send_notification "codex-rotate" "Account '${alias}' cooldown expired — now available"
+  fi
+}
+
 get_next_available() {
+  local target_group="${CODEX_ROTATE__GROUP:-}"
+
   # If quota-aware rotation is enabled, try quota-based selection first
   if (( QUOTA_AWARE_ROTATION == 1 )); then
     local quota_pick
@@ -468,6 +538,10 @@ get_next_available() {
     idx=$(( (start_idx + i) % total ))
     alias="${all_aliases[$idx]}"
     [[ -f "${CREDENTIALS_DIR}/${alias}.json" ]] || continue
+    clear_expired_cooldown_if_needed "${alias}"
+    if [[ -n "${target_group}" ]] && [[ "$(get_account_group "${alias}")" != "${target_group}" ]]; then
+      continue
+    fi
     if ! is_on_cooldown "${alias}"; then
       printf "%s" "${alias}"
       return 0
@@ -510,9 +584,14 @@ get_best_quota_account() {
 
   local best_alias="" best_pct=101
   local alias tokens usage_json pct
+  local target_group="${CODEX_ROTATE__GROUP:-}"
 
   for alias in "${all_aliases[@]}"; do
     [[ -f "${CREDENTIALS_DIR}/${alias}.json" ]] || continue
+    clear_expired_cooldown_if_needed "${alias}"
+    if [[ -n "${target_group}" ]] && [[ "$(get_account_group "${alias}")" != "${target_group}" ]]; then
+      continue
+    fi
     is_on_cooldown "${alias}" && continue
 
     tokens="$(get_account_tokens "${alias}")"
@@ -1058,6 +1137,7 @@ cmd_add() {
 
   local alias=""
   local force=0
+  local group=""
 
   if (( $# < 1 )); then
     die "Usage: ${SCRIPT_NAME} add <alias> [--force]"
@@ -1069,6 +1149,12 @@ cmd_add() {
   while (( $# > 0 )); do
     case "$1" in
       --force) force=1 ;;
+      --group=*) group="${1#--group=}" ;;
+      --group)
+        shift
+        [[ $# -gt 0 ]] || die "--group requires value"
+        group="$1"
+        ;;
       *) die "Unknown flag for add: $1" ;;
     esac
     shift
@@ -1105,7 +1191,7 @@ cmd_add() {
   chmod 600 "${CREDENTIALS_DIR}/${alias}.json"
 
   local lock_cmd
-  lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_add_state" "${alias}")
+  lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_add_state" "${alias}" "${group}")
   with_lock "${lock_cmd}"
 
   # Clean up temp dir manually now and clear the EXIT trap (avoids unbound-variable issue under set -u)
@@ -1117,7 +1203,8 @@ cmd_add() {
 
 internal_add_state() {
   local alias="$1"
-  init_account_state_entry "${alias}"
+  local group="${2:-}"
+  init_account_state_entry "${alias}" "${group}"
   append_order "${alias}"
 }
 
@@ -1256,21 +1343,101 @@ cmd_list() {
   require_initialized
   load_config
 
+  local json_output=0
+  local args=()
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --json) json_output=1 ;;
+      *) args+=("${arg}") ;;
+    esac
+  done
+
   mapfile -t all_aliases < <(get_order)
   local active
   active="$(get_active)"
+  local show_group=0
+  if [[ -f "${STATE_FILE}" ]]; then
+    if jq -e '[.accounts[].group // empty] | map(select(length > 0)) | length > 0' "${STATE_FILE}" >/dev/null 2>&1; then
+      show_group=1
+    fi
+  fi
 
-  printf "%-15s %-25s %-16s %-6s %-10s %-10s %-8s\n" \
-    "ALIAS" "EMAIL" "STATUS" "USES" "PLAN" "LAST USED" "COOLDOWN"
-  printf "%-15s %-25s %-16s %-6s %-10s %-10s %-8s\n" \
-    "───────────────" "─────────────────────────" "────────────────" "──────" "──────────" "──────────" "────────"
+  if (( json_output == 1 )); then
+    local json_result alias status_value uses last_used cooldown_secs email plan active_json alias_json
+    json_result="$(jq -n '[]')"
 
-  if (( ${#all_aliases[@]} == 0 )); then
-    printf "%-15s %-25s %-16s %-6s %-10s %-10s %-8s\n" "(none)" "-" "-" "-" "-" "-" "-"
+    for alias in "${all_aliases[@]}"; do
+      uses="$(get_account_state "${alias}" "total_uses")"
+      uses="${uses:-0}"
+      [[ "${uses}" =~ ^[0-9]+$ ]] || uses=0
+      last_used="$(get_account_state "${alias}" "last_used")"
+      cooldown_secs="$(cooldown_remaining "${alias}")"
+      email="$(get_account_email "${alias}")"
+      plan="$(get_account_plan "${alias}")"
+      email="${email:-unknown}"
+      plan="${plan:-unknown}"
+
+      status_value="ready"
+      active_json="false"
+      if [[ ! -f "${CREDENTIALS_DIR}/${alias}.json" ]]; then
+        status_value="missing_credentials"
+      elif [[ "${alias}" == "${active}" ]]; then
+        status_value="active"
+        active_json="true"
+      elif (( cooldown_secs > 0 )); then
+        status_value="cooldown"
+      fi
+
+      alias_json="$(jq -n \
+        --arg alias "${alias}" \
+        --argjson active "${active_json}" \
+        --arg email "${email}" \
+        --arg status "${status_value}" \
+        --argjson uses "${uses}" \
+        --arg plan "${plan}" \
+        --arg last_used "${last_used}" \
+        --argjson cooldown "${cooldown_secs}" \
+        '{
+          alias: $alias,
+          active: $active,
+          email: $email,
+          status: $status,
+          uses: $uses,
+          plan: $plan,
+          last_used: (if $last_used == "" then null else $last_used end),
+          cooldown: (if $cooldown > 0 then $cooldown else null end)
+        }')"
+
+      json_result="$(jq --argjson item "${alias_json}" '. += [$item]' <<< "${json_result}")"
+    done
+
+    printf '%s\n' "${json_result}"
     return 0
   fi
 
-  local alias status uses last_used last_epoch last_str cooldown_secs cooldown_str email plan
+  if (( show_group == 1 )); then
+    printf "%-15s %-25s %-12s %-16s %-6s %-10s %-10s %-8s\n" \
+      "ALIAS" "EMAIL" "GROUP" "STATUS" "USES" "PLAN" "LAST USED" "COOLDOWN"
+    printf "%-15s %-25s %-12s %-16s %-6s %-10s %-10s %-8s\n" \
+      "───────────────" "─────────────────────────" "────────────" "────────────────" "──────" "──────────" "──────────" "────────"
+  else
+    printf "%-15s %-25s %-16s %-6s %-10s %-10s %-8s\n" \
+      "ALIAS" "EMAIL" "STATUS" "USES" "PLAN" "LAST USED" "COOLDOWN"
+    printf "%-15s %-25s %-16s %-6s %-10s %-10s %-8s\n" \
+      "───────────────" "─────────────────────────" "────────────────" "──────" "──────────" "──────────" "────────"
+  fi
+
+  if (( ${#all_aliases[@]} == 0 )); then
+    if (( show_group == 1 )); then
+      printf "%-15s %-25s %-12s %-16s %-6s %-10s %-10s %-8s\n" "(none)" "-" "-" "-" "-" "-" "-" "-"
+    else
+      printf "%-15s %-25s %-16s %-6s %-10s %-10s %-8s\n" "(none)" "-" "-" "-" "-" "-" "-"
+    fi
+    return 0
+  fi
+
+  local alias status uses last_used last_epoch last_str cooldown_secs cooldown_str email plan group
   for alias in "${all_aliases[@]}"; do
     status="$(render_status_label "${alias}" "${active}")"
     uses="$(get_account_state "${alias}" "total_uses")"
@@ -1281,6 +1448,7 @@ cmd_list() {
     cooldown_secs="$(cooldown_remaining "${alias}")"
     email="$(get_account_email "${alias}")"
     plan="$(get_account_plan "${alias}")"
+    group="$(get_account_group "${alias}")"
 
     # Truncate email for display
     if [[ ${#email} -gt 24 ]]; then
@@ -1293,8 +1461,13 @@ cmd_list() {
       cooldown_str="-"
     fi
 
-    printf "%-15s %-25s %-16b %-6s %-10s %-10s %-8s\n" \
-      "${alias}" "${email:-unknown}" "${status}" "${uses}" "${plan:-?}" "${last_str}" "${cooldown_str}"
+    if (( show_group == 1 )); then
+      printf "%-15s %-25s %-12s %-16b %-6s %-10s %-10s %-8s\n" \
+        "${alias}" "${email:-unknown}" "${group:-}" "${status}" "${uses}" "${plan:-?}" "${last_str}" "${cooldown_str}"
+    else
+      printf "%-15s %-25s %-16b %-6s %-10s %-10s %-8s\n" \
+        "${alias}" "${email:-unknown}" "${status}" "${uses}" "${plan:-?}" "${last_str}" "${cooldown_str}"
+    fi
   done
 }
 
@@ -1346,9 +1519,94 @@ cmd_status() {
   require_initialized
   load_config
 
+  local json_output=0
+  local args=()
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --json) json_output=1 ;;
+      *) args+=("${arg}") ;;
+    esac
+  done
+
   mapfile -t all_aliases < <(get_order)
   local active
   active="$(get_active)"
+
+  if (( json_output == 1 )); then
+    local accounts_json alias status_value uses last_used cooldown_secs email plan active_json alias_json
+    local quota_aware_json="false"
+    (( QUOTA_AWARE_ROTATION == 1 )) && quota_aware_json="true"
+
+    accounts_json="$(jq -n '[]')"
+    for alias in "${all_aliases[@]}"; do
+      uses="$(get_account_state "${alias}" "total_uses")"
+      uses="${uses:-0}"
+      [[ "${uses}" =~ ^[0-9]+$ ]] || uses=0
+      last_used="$(get_account_state "${alias}" "last_used")"
+      cooldown_secs="$(cooldown_remaining "${alias}")"
+      email="$(get_account_email "${alias}")"
+      plan="$(get_account_plan "${alias}")"
+      email="${email:-unknown}"
+      plan="${plan:-unknown}"
+
+      status_value="ready"
+      active_json="false"
+      if [[ ! -f "${CREDENTIALS_DIR}/${alias}.json" ]]; then
+        status_value="missing_credentials"
+      elif [[ "${alias}" == "${active}" ]]; then
+        status_value="active"
+        active_json="true"
+      elif (( cooldown_secs > 0 )); then
+        status_value="cooldown"
+      fi
+
+      alias_json="$(jq -n \
+        --arg alias "${alias}" \
+        --argjson active "${active_json}" \
+        --arg email "${email}" \
+        --arg status "${status_value}" \
+        --argjson uses "${uses}" \
+        --arg plan "${plan}" \
+        --arg last_used "${last_used}" \
+        --argjson cooldown "${cooldown_secs}" \
+        '{
+          alias: $alias,
+          active: $active,
+          email: $email,
+          status: $status,
+          uses: $uses,
+          plan: $plan,
+          last_used: (if $last_used == "" then null else $last_used end),
+          cooldown: (if $cooldown > 0 then $cooldown else null end)
+        }')"
+
+      accounts_json="$(jq --argjson item "${alias_json}" '. += [$item]' <<< "${accounts_json}")"
+    done
+
+    jq -n \
+      --arg version "${SCRIPT_VERSION}" \
+      --argjson rotation_interval "${ROTATION_INTERVAL}" \
+      --argjson hourly_cooldown "${HOURLY_COOLDOWN}" \
+      --argjson daily_cooldown "${DAILY_COOLDOWN}" \
+      --argjson weekly_cooldown "${WEEKLY_COOLDOWN}" \
+      --argjson max_retries "${MAX_RETRIES}" \
+      --argjson quota_aware_rotation "${quota_aware_json}" \
+      --argjson accounts "${accounts_json}" \
+      '{
+        version: $version,
+        config: {
+          rotation_interval: $rotation_interval,
+          hourly_cooldown: $hourly_cooldown,
+          daily_cooldown: $daily_cooldown,
+          weekly_cooldown: $weekly_cooldown,
+          max_retries: $max_retries,
+          quota_aware_rotation: $quota_aware_rotation
+        },
+        accounts: $accounts
+      }'
+    return 0
+  fi
 
   printf "\n"
   printf "%b╔══════════════════════════════════════════════════════════════════════════════╗%b\n" "${BLUE}" "${RESET}"
@@ -1460,8 +1718,9 @@ run_codex_capture_and_retry() {
     set -e
 
     if (( cmd_exit != 0 )) && detect_rate_limit "${out_file}"; then
-      local current cd_seconds next
+      local current cd_seconds next old_alias
       current="$(get_active)"
+      old_alias="${current}"
       cd_seconds="$(classify_cooldown "${out_file}")"
 
       local lock_cmd
@@ -1479,6 +1738,7 @@ run_codex_capture_and_retry() {
       local switch_cmd
       switch_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_switch" "${next}")
       with_lock "${switch_cmd}"
+      send_notification "codex-rotate" "Switched from '${old_alias}' to '${next}' (rate limit hit)"
 
       rm -f "${out_file}"
       attempt=$(( attempt + 1 ))
@@ -1517,6 +1777,25 @@ cmd_run() {
   require_initialized
   load_config
 
+  local group=""
+  local -a cmd_args=()
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --group=*) group="${arg#--group=}" ;;
+      --group)
+        die "Use --group=<name>"
+        ;;
+      *) cmd_args+=("${arg}") ;;
+    esac
+  done
+
+  if [[ -n "${group}" ]]; then
+    export CODEX_ROTATE__GROUP="${group}"
+  else
+    unset CODEX_ROTATE__GROUP || true
+  fi
+
   local lock_cmd
   lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_ensure_active_ready")
   with_lock "${lock_cmd}"
@@ -1526,12 +1805,11 @@ cmd_run() {
   # - args without 'exec': treat as potentially interactive and run direct
   # - args with 'exec': capture output for RL detection and retry
   local interactive=0
-  if (( $# == 0 )); then
+  if (( ${#cmd_args[@]} == 0 )); then
     interactive=1
   else
     local has_exec=0
-    local arg
-    for arg in "$@"; do
+    for arg in "${cmd_args[@]}"; do
       if [[ "${arg}" == "exec" ]]; then
         has_exec=1
         break
@@ -1556,7 +1834,7 @@ cmd_run() {
       set +e
       # Run codex with TTY intact for stdout, but tee stderr to our log file
       # using process substitution so the user still sees all stderr output.
-      { "${CODEX_BIN}" "$@" 2> >(tee "${err_file}" >&2); } 
+      { "${CODEX_BIN}" "${cmd_args[@]}" 2> >(tee "${err_file}" >&2); }
       local cmd_exit=$?
       set -e
 
@@ -1564,8 +1842,9 @@ cmd_run() {
       sleep 0.1
 
       if (( cmd_exit != 0 )) && detect_rate_limit "${err_file}"; then
-        local current cd_seconds next
+        local current cd_seconds next old_alias
         current="$(get_active)"
+        old_alias="${current}"
         cd_seconds="$(classify_cooldown "${err_file}")"
 
         local lock_cmd
@@ -1579,6 +1858,7 @@ cmd_run() {
           local switch_cmd
           switch_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_switch" "${next}")
           with_lock "${switch_cmd}"
+          send_notification "codex-rotate" "Switched from '${old_alias}' to '${next}' (rate limit hit)"
 
           rm -f "${err_file}"
           attempt=$(( attempt + 1 ))
@@ -1608,7 +1888,7 @@ cmd_run() {
     return
   fi
 
-  run_codex_capture_and_retry "$@"
+  run_codex_capture_and_retry "${cmd_args[@]}"
 }
 
 internal_ensure_active_ready() {
@@ -1618,6 +1898,25 @@ internal_ensure_active_ready() {
 cmd_auto() {
   require_initialized
   load_config
+
+  local group=""
+  local -a cmd_args=()
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --group=*) group="${arg#--group=}" ;;
+      --group)
+        die "Use --group=<name>"
+        ;;
+      *) cmd_args+=("${arg}") ;;
+    esac
+  done
+
+  if [[ -n "${group}" ]]; then
+    export CODEX_ROTATE__GROUP="${group}"
+  else
+    unset CODEX_ROTATE__GROUP || true
+  fi
 
   # Enable quota-aware rotation for auto mode.
   # Export as environment variable so it survives the with_lock subprocess
@@ -1629,7 +1928,7 @@ cmd_auto() {
   lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_auto_preflight")
   with_lock "${lock_cmd}"
 
-  cmd_run "$@"
+  cmd_run "${cmd_args[@]}"
 }
 
 internal_auto_preflight() {
@@ -1731,6 +2030,74 @@ cmd_uncooldown() {
   log_success "Cooldown cleared for '${alias}'"
 }
 
+internal_group_set() {
+  local alias="$1"
+  local group="$2"
+  set_account_group "${alias}" "${group}"
+}
+
+internal_group_unset() {
+  local alias="$1"
+  local tmp="${STATE_FILE}.tmp.$$"
+  jq --arg a "${alias}" '.accounts[$a].group = ""' "${STATE_FILE}" > "${tmp}" && mv "${tmp}" "${STATE_FILE}"
+}
+
+cmd_group() {
+  local subcmd="${1:-}"
+  shift || true
+
+  case "${subcmd}" in
+    set)
+      local alias="${1:-}"
+      local group="${2:-}"
+      [[ -z "${alias}" ]] && die "Usage: ${SCRIPT_NAME} group set <alias> <group>"
+      [[ -z "${group}" ]] && die "Usage: ${SCRIPT_NAME} group set <alias> <group>"
+      require_initialized
+      load_config
+      [[ ! -f "${CREDENTIALS_DIR}/${alias}.json" ]] && die "Account '${alias}' not found."
+      local cmd
+      cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_group_set" "${alias}" "${group}")
+      with_lock "${cmd}"
+      log_info "Account '${alias}' added to group '${group}'."
+      ;;
+    unset)
+      local alias="${1:-}"
+      [[ -z "${alias}" ]] && die "Usage: ${SCRIPT_NAME} group unset <alias>"
+      require_initialized
+      load_config
+      [[ ! -f "${CREDENTIALS_DIR}/${alias}.json" ]] && die "Account '${alias}' not found."
+      local cmd
+      cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_group_unset" "${alias}")
+      with_lock "${cmd}"
+      log_info "Group cleared for account '${alias}'."
+      ;;
+    list)
+      require_initialized
+      load_config
+      local groups=()
+      if [[ -f "${STATE_FILE}" ]]; then
+        while IFS= read -r g; do
+          [[ -n "${g}" ]] && groups+=("${g}")
+        done < <(jq -r '[.accounts[].group // empty] | unique[]' "${STATE_FILE}" 2>/dev/null)
+      fi
+      if [[ ${#groups[@]} -eq 0 ]]; then
+        log_info "No groups defined."
+      else
+        printf "GROUPS:\n"
+        local g
+        for g in "${groups[@]}"; do
+          local members
+          members=$(jq -r --arg g "${g}" '[.accounts | to_entries[] | select(.value.group == $g) | .key] | join(", ")' "${STATE_FILE}" 2>/dev/null)
+          printf "  %-20s %s\n" "${g}" "${members}"
+        done
+      fi
+      ;;
+    *)
+      die "Usage: ${SCRIPT_NAME} group <set|unset|list> [args]"
+      ;;
+  esac
+}
+
 internal_uncooldown() {
   local alias="$1"
   set_account_state "${alias}" "cooldown_until" "0"
@@ -1742,10 +2109,20 @@ cmd_quota() {
 
   command -v curl >/dev/null 2>&1 || die "curl is required for quota checking"
 
+  local json_output=0
+  local args=()
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --json) json_output=1 ;;
+      *) args+=("${arg}") ;;
+    esac
+  done
+
   local aliases_to_check=()
 
-  if (( $# > 0 )); then
-    local alias="$1"
+  if (( ${#args[@]} > 0 )); then
+    local alias="${args[0]}"
     validate_alias "${alias}" || die "Invalid alias '${alias}'."
     account_exists "${alias}" || die "Alias '${alias}' not found"
     aliases_to_check=("${alias}")
@@ -1759,6 +2136,93 @@ cmd_quota() {
 
   local alias email plan usage_json primary_pct primary_reset secondary_pct secondary_reset
   local credits_balance credits_unlimited plan_type_from_api
+
+  if (( json_output == 1 )); then
+    local json_result usage_error now_ts primary_reset_epoch secondary_reset_epoch
+    local primary_reset_seconds secondary_reset_seconds item_json
+    json_result="$(jq -n '[]')"
+
+    for alias in "${aliases_to_check[@]}"; do
+      email="$(get_account_email "${alias}")"
+      plan="$(get_account_plan "${alias}")"
+      email="${email:-unknown}"
+      plan="${plan:-unknown}"
+      usage_json="$(query_usage_api "${alias}")"
+
+      if [[ "${usage_json}" == ERROR:* ]]; then
+        usage_error="${usage_json#ERROR:}"
+        item_json="$(jq -n \
+          --arg alias "${alias}" \
+          --arg email "${email}" \
+          --arg plan "${plan}" \
+          --arg error "${usage_error}" \
+          '{
+            alias: $alias,
+            email: $email,
+            plan: $plan,
+            five_hour_usage_pct: null,
+            weekly_usage_pct: null,
+            five_hour_reset_seconds: null,
+            weekly_reset_seconds: null,
+            error: $error
+          }')"
+      else
+        primary_pct="$(printf "%s" "${usage_json}" | jq -r '.rate_limit.primary_window.used_percent // 0' 2>/dev/null || true)"
+        secondary_pct="$(printf "%s" "${usage_json}" | jq -r '.rate_limit.secondary_window.used_percent // 0' 2>/dev/null || true)"
+        [[ "${primary_pct}" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || primary_pct="0"
+        [[ "${secondary_pct}" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || secondary_pct="0"
+
+        primary_reset="$(printf "%s" "${usage_json}" | jq -r '.rate_limit.primary_window.reset_at // empty' 2>/dev/null || true)"
+        secondary_reset="$(printf "%s" "${usage_json}" | jq -r '.rate_limit.secondary_window.reset_at // empty' 2>/dev/null || true)"
+
+        primary_reset_seconds="null"
+        if [[ -n "${primary_reset}" ]]; then
+          primary_reset_epoch="$(parse_reset_epoch "${primary_reset}")"
+          now_ts="$(now_epoch)"
+          if (( primary_reset_epoch > now_ts )); then
+            primary_reset_seconds="$(( primary_reset_epoch - now_ts ))"
+          else
+            primary_reset_seconds="0"
+          fi
+        fi
+
+        secondary_reset_seconds="null"
+        if [[ -n "${secondary_reset}" ]]; then
+          secondary_reset_epoch="$(parse_reset_epoch "${secondary_reset}")"
+          now_ts="$(now_epoch)"
+          if (( secondary_reset_epoch > now_ts )); then
+            secondary_reset_seconds="$(( secondary_reset_epoch - now_ts ))"
+          else
+            secondary_reset_seconds="0"
+          fi
+        fi
+
+        item_json="$(jq -n \
+          --arg alias "${alias}" \
+          --arg email "${email}" \
+          --arg plan "${plan}" \
+          --argjson five_hour_usage_pct "${primary_pct}" \
+          --argjson weekly_usage_pct "${secondary_pct}" \
+          --argjson five_hour_reset_seconds "${primary_reset_seconds}" \
+          --argjson weekly_reset_seconds "${secondary_reset_seconds}" \
+          '{
+            alias: $alias,
+            email: $email,
+            plan: $plan,
+            five_hour_usage_pct: $five_hour_usage_pct,
+            weekly_usage_pct: $weekly_usage_pct,
+            five_hour_reset_seconds: $five_hour_reset_seconds,
+            weekly_reset_seconds: $weekly_reset_seconds,
+            error: null
+          }')"
+      fi
+
+      json_result="$(jq --argjson item "${item_json}" '. += [$item]' <<< "${json_result}")"
+    done
+
+    printf '%s\n' "${json_result}"
+    return 0
+  fi
 
   for alias in "${aliases_to_check[@]}"; do
     email="$(get_account_email "${alias}")"
@@ -1852,10 +2316,20 @@ cmd_email() {
   require_initialized
   load_config
 
+  local json_output=0
+  local args=()
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --json) json_output=1 ;;
+      *) args+=("${arg}") ;;
+    esac
+  done
+
   local aliases_to_check=()
 
-  if (( $# > 0 )); then
-    local alias="$1"
+  if (( ${#args[@]} > 0 )); then
+    local alias="${args[0]}"
     validate_alias "${alias}" || die "Invalid alias '${alias}'."
     account_exists "${alias}" || die "Alias '${alias}' not found"
     aliases_to_check=("${alias}")
@@ -1865,6 +2339,42 @@ cmd_email() {
 
   if (( ${#aliases_to_check[@]} == 0 )); then
     die "No accounts configured. Use '${SCRIPT_NAME} add' first."
+  fi
+
+  if (( json_output == 1 )); then
+    local json_result alias email plan tokens account_id access_token item_json
+    json_result="$(jq -n '[]')"
+
+    for alias in "${aliases_to_check[@]}"; do
+      email="$(get_account_email "${alias}")"
+      plan="$(get_account_plan "${alias}")"
+      email="${email:-unknown}"
+      plan="${plan:-unknown}"
+
+      tokens="$(get_account_tokens "${alias}")"
+      account_id="$(printf "%s" "${tokens}" | jq -r '.account_id // empty' 2>/dev/null || true)"
+      if [[ -z "${account_id}" ]]; then
+        access_token="$(printf "%s" "${tokens}" | jq -r '.access_token // empty' 2>/dev/null || true)"
+        account_id="$(extract_account_id_from_token "${access_token}")"
+      fi
+
+      item_json="$(jq -n \
+        --arg alias "${alias}" \
+        --arg email "${email}" \
+        --arg plan "${plan}" \
+        --arg account_id "${account_id}" \
+        '{
+          alias: $alias,
+          email: $email,
+          plan: $plan,
+          account_id: (if $account_id == "" then null else $account_id end)
+        }')"
+
+      json_result="$(jq --argjson item "${item_json}" '. += [$item]' <<< "${json_result}")"
+    done
+
+    printf '%s\n' "${json_result}"
+    return 0
   fi
 
   printf "%-20s %-35s %-10s\n" "ALIAS" "EMAIL" "PLAN"
@@ -1915,6 +2425,372 @@ cmd_refresh() {
   return "${had_failure}"
 }
 
+cmd_doctor() {
+  local errors=0 warnings=0
+
+  printf "%s\n" "${SCRIPT_NAME} v${SCRIPT_VERSION} — System Diagnostics"
+  printf "%s\n\n" "$(printf '%.0s─' {1..50})"
+
+  # Check 1: Bash version >= 4
+  printf "  %-35s " "Bash version (≥ 4 required)"
+  if [[ ${BASH_VERSINFO[0]} -ge 4 ]]; then
+    printf "\e[32m[✓]\e[0m %s\n" "v${BASH_VERSION}"
+  else
+    printf "\e[31m[✗]\e[0m %s\n" "v${BASH_VERSION} — Bash 4+ required"
+    ((errors+=1))
+  fi
+
+  # Check 2: jq
+  printf "  %-35s " "jq (JSON processor)"
+  if command -v jq >/dev/null 2>&1; then
+    printf "\e[32m[✓]\e[0m %s\n" "$(jq --version 2>&1)"
+  else
+    printf "\e[31m[✗]\e[0m %s\n" "not found — install with: apt install jq / brew install jq"
+    ((errors+=1))
+  fi
+
+  # Check 3: curl
+  printf "  %-35s " "curl (HTTP client)"
+  if command -v curl >/dev/null 2>&1; then
+    printf "\e[32m[✓]\e[0m %s\n" "$(curl --version 2>&1 | head -n 1 | cut -d' ' -f1-2)"
+  else
+    printf "\e[31m[✗]\e[0m %s\n" "not found — required for quota/refresh"
+    ((errors+=1))
+  fi
+
+  # Check 4: flock
+  printf "  %-35s " "flock (file locking)"
+  if command -v flock >/dev/null 2>&1; then
+    printf "\e[32m[✓]\e[0m %s\n" "available"
+  else
+    printf "\e[31m[✗]\e[0m %s\n" "not found — install with: apt install util-linux / brew install util-linux"
+    ((errors+=1))
+  fi
+
+  # Check 5: Codex CLI
+  printf "  %-35s " "Codex CLI"
+  local codex_path
+  codex_path=$(command -v codex 2>/dev/null || true)
+  if [[ -n "${codex_path}" ]]; then
+    printf "\e[32m[✓]\e[0m %s\n" "${codex_path}"
+  else
+    printf "\e[33m[!]\e[0m %s\n" "not found in PATH — required for run/auto commands"
+    ((warnings+=1))
+  fi
+
+  # Check 6: Accounts directory
+  printf "  %-35s " "Accounts directory"
+  if [[ -d "${ACCOUNTS_DIR}" ]]; then
+    local dir_perms
+    dir_perms=$(stat -c "%a" "${ACCOUNTS_DIR}" 2>/dev/null || stat -f "%OLp" "${ACCOUNTS_DIR}" 2>/dev/null || echo "unknown")
+    if [[ "${dir_perms}" == "700" ]]; then
+      printf "\e[32m[✓]\e[0m %s\n" "${ACCOUNTS_DIR} (${dir_perms})"
+    else
+      printf "\e[33m[!]\e[0m %s\n" "${ACCOUNTS_DIR} (perms: ${dir_perms}, expected 700)"
+      ((warnings+=1))
+    fi
+  else
+    printf "\e[33m[!]\e[0m %s\n" "not initialized — run: ${SCRIPT_NAME} init"
+    ((warnings+=1))
+  fi
+
+  # Check 7: Credentials directory permissions
+  printf "  %-35s " "Credentials directory"
+  if [[ -d "${CREDENTIALS_DIR}" ]]; then
+    local cred_perms
+    cred_perms=$(stat -c "%a" "${CREDENTIALS_DIR}" 2>/dev/null || stat -f "%OLp" "${CREDENTIALS_DIR}" 2>/dev/null || echo "unknown")
+    if [[ "${cred_perms}" == "700" ]]; then
+      printf "\e[32m[✓]\e[0m %s\n" "${CREDENTIALS_DIR} (${cred_perms})"
+    else
+      printf "\e[33m[!]\e[0m %s\n" "perms: ${cred_perms}, expected 700"
+      ((warnings+=1))
+    fi
+  else
+    printf "\e[33m[!]\e[0m %s\n" "not found"
+    ((warnings+=1))
+  fi
+
+  # Check 8: Auth symlink
+  printf "  %-35s " "Auth symlink"
+  if [[ -L "${CODEX_AUTH}" ]]; then
+    local target
+    target=$(readlink "${CODEX_AUTH}" 2>/dev/null || echo "unknown")
+    if [[ -f "${target}" ]]; then
+      printf "\e[32m[✓]\e[0m %s\n" "→ ${target}"
+    else
+      printf "\e[31m[✗]\e[0m %s\n" "broken symlink → ${target}"
+      ((errors+=1))
+    fi
+  elif [[ -f "${CODEX_AUTH}" ]]; then
+    printf "\e[33m[!]\e[0m %s\n" "regular file (not managed by ${SCRIPT_NAME})"
+    ((warnings+=1))
+  else
+    printf "\e[33m[!]\e[0m %s\n" "not found — add an account first"
+    ((warnings+=1))
+  fi
+
+  # Check 9: Account count
+  printf "  %-35s " "Accounts configured"
+  local count=0
+  if [[ -d "${CREDENTIALS_DIR}" ]]; then
+    count=$(find "${CREDENTIALS_DIR}" -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  if [[ "${count}" -gt 0 ]]; then
+    printf "\e[32m[✓]\e[0m %s\n" "${count} account(s)"
+  else
+    printf "\e[33m[!]\e[0m %s\n" "no accounts — run: ${SCRIPT_NAME} add <alias>"
+    ((warnings+=1))
+  fi
+
+  # Check 10: Token health (check active account)
+  printf "  %-35s " "Active token health"
+  if [[ -f "${ACTIVE_FILE}" ]]; then
+    local active_alias
+    active_alias=$(cat "${ACTIVE_FILE}" 2>/dev/null || echo "")
+    if [[ -n "${active_alias}" && -f "${CREDENTIALS_DIR}/${active_alias}.json" ]]; then
+      local access_token
+      access_token=$(jq -r '.access_token // empty' "${CREDENTIALS_DIR}/${active_alias}.json" 2>/dev/null || echo "")
+      if [[ -n "${access_token}" ]]; then
+        # Check JWT expiry
+        local payload
+        payload=$(printf '%s' "${access_token}" | cut -d. -f2 2>/dev/null || echo "")
+        if [[ -n "${payload}" ]]; then
+          # Add padding
+          local padded="${payload}"
+          local mod=$(( ${#payload} % 4 ))
+          if [[ ${mod} -eq 2 ]]; then
+            padded="${payload}=="
+          elif [[ ${mod} -eq 3 ]]; then
+            padded="${payload}="
+          fi
+          local exp
+          exp=$(printf '%s' "${padded}" | base64 -d 2>/dev/null | jq -r '.exp // empty' 2>/dev/null || echo "")
+          if [[ -n "${exp}" ]]; then
+            local now
+            now=$(date +%s)
+            if [[ "${exp}" -gt "${now}" ]]; then
+              local remaining=$(( exp - now ))
+              local hours=$(( remaining / 3600 ))
+              local mins=$(( (remaining % 3600) / 60 ))
+              printf "\e[32m[✓]\e[0m %s\n" "valid (expires in ${hours}h ${mins}m)"
+            else
+              printf "\e[31m[✗]\e[0m %s\n" "expired — run: ${SCRIPT_NAME} refresh ${active_alias}"
+              ((errors++))
+            fi
+          else
+            printf "\e[33m[!]\e[0m %s\n" "cannot parse expiry"
+            ((warnings+=1))
+          fi
+        else
+          printf "\e[33m[!]\e[0m %s\n" "cannot decode token"
+          ((warnings+=1))
+        fi
+      else
+        printf "\e[31m[✗]\e[0m %s\n" "no access_token in credential file"
+        ((errors+=1))
+      fi
+    else
+      printf "\e[33m[!]\e[0m %s\n" "no active account set"
+      ((warnings+=1))
+    fi
+  else
+    printf "\e[33m[!]\e[0m %s\n" "no active account"
+    ((warnings+=1))
+  fi
+
+  printf "\n"
+  if [[ ${errors} -eq 0 && ${warnings} -eq 0 ]]; then
+    printf "\e[32m✓ All systems operational.\e[0m\n"
+  elif [[ ${errors} -eq 0 ]]; then
+    printf "\e[33m! %d warning(s), no errors.\e[0m\n" "${warnings}"
+  else
+    printf "\e[31m✗ %d error(s), %d warning(s).\e[0m\n" "${errors}" "${warnings}"
+  fi
+
+  return "${errors}"
+}
+
+cmd_upgrade() {
+  if ! command -v npm >/dev/null 2>&1; then
+    die "npm is required for upgrade. Install Node.js first, or upgrade manually."
+  fi
+
+  log_info "Checking for updates..."
+
+  local current="${SCRIPT_VERSION}"
+  local latest
+  latest=$(npm view codex-rotate version 2>/dev/null || echo "")
+
+  if [[ -z "${latest}" ]]; then
+    die "Could not fetch latest version from npm registry."
+  fi
+
+  if [[ "${current}" == "${latest}" ]]; then
+    log_info "Already on latest version (v${current})."
+    return 0
+  fi
+
+  log_info "Update available: v${current} → v${latest}"
+
+  # Fetch changelog summary if available
+  local changelog_url="https://raw.githubusercontent.com/vaskoyudha/MultipleAccountCodex/main/CHANGELOG.md"
+  local changelog
+  changelog=$(curl -fsSL "${changelog_url}" 2>/dev/null || echo "")
+  if [[ -n "${changelog}" ]]; then
+    # Extract the section for the latest version
+    local section
+    section=$(printf '%s' "${changelog}" | sed -n "/^## \[${latest}\]/,/^## \[/p" | head -n -1)
+    if [[ -n "${section}" ]]; then
+      printf "\n%s\n\n" "${section}"
+    fi
+  fi
+
+  log_info "Upgrading via npm..."
+  if npm install -g codex-rotate@latest 2>&1; then
+    log_info "Successfully upgraded to v${latest}."
+  else
+    log_error "Upgrade failed. Try manually: npm install -g codex-rotate@latest"
+    return 1
+  fi
+}
+
+cmd_tui() {
+  local tui_cmd=""
+  if command -v whiptail >/dev/null 2>&1; then
+    tui_cmd="whiptail"
+  elif command -v dialog >/dev/null 2>&1; then
+    tui_cmd="dialog"
+  else
+    die "Neither whiptail nor dialog found. Install one: apt install whiptail / brew install dialog"
+  fi
+
+  local height=20 width=70 menu_height=12
+
+  while true; do
+    local choice
+    choice=$("${tui_cmd}" --title "${SCRIPT_NAME} v${SCRIPT_VERSION}" \
+      --menu "Select an action:" "${height}" "${width}" "${menu_height}" \
+      "list" "List all accounts" \
+      "status" "Account dashboard" \
+      "quota" "Check usage/quota" \
+      "email" "Show email & plan" \
+      "switch" "Switch active account" \
+      "add" "Add new account" \
+      "refresh" "Refresh all tokens" \
+      "doctor" "System diagnostics" \
+      "cooldown" "Manage cooldowns" \
+      "help" "Show help" \
+      "exit" "Exit" \
+      3>&1 1>&2 2>&3) || break
+
+    case "${choice}" in
+      list)
+        "${tui_cmd}" --title "Account List" --msgbox "$(cmd_list 2>&1)" "${height}" "${width}"
+        ;;
+      status)
+        "${tui_cmd}" --title "Status Dashboard" --msgbox "$(cmd_status 2>&1)" "${height}" 90
+        ;;
+      quota)
+        "${tui_cmd}" --title "Quota Check" --infobox "Fetching quota data..." 5 40
+        "${tui_cmd}" --title "Usage Quota" --msgbox "$(cmd_quota 2>&1)" "${height}" 90
+        ;;
+      email)
+        "${tui_cmd}" --title "Account Emails" --msgbox "$(cmd_email 2>&1)" "${height}" "${width}"
+        ;;
+      switch)
+        local items=()
+        if [[ -f "${ORDER_FILE}" ]]; then
+          while IFS= read -r alias_name; do
+            [[ -z "${alias_name}" ]] && continue
+            local active_mark=""
+            if [[ -f "${ACTIVE_FILE}" ]]; then
+              local current_active
+              current_active="$(<"${ACTIVE_FILE}")"
+              if [[ "${current_active}" == "${alias_name}" ]]; then
+                active_mark=" (active)"
+              fi
+            fi
+            items+=("${alias_name}" "${alias_name}${active_mark}")
+          done < "${ORDER_FILE}"
+        fi
+        if [[ ${#items[@]} -eq 0 ]]; then
+          "${tui_cmd}" --title "Switch" --msgbox "No accounts configured." 8 40
+        else
+          local selected
+          selected=$("${tui_cmd}" --title "Switch Account" \
+            --menu "Select account to activate:" "${height}" "${width}" "${menu_height}" \
+            "${items[@]}" 3>&1 1>&2 2>&3) || continue
+          local switch_output
+          switch_output="$(cmd_switch "${selected}" 2>&1)"
+          "${tui_cmd}" --title "Switched" --msgbox "${switch_output}" 8 60
+        fi
+        ;;
+      add)
+        local new_alias
+        new_alias=$("${tui_cmd}" --title "Add Account" \
+          --inputbox "Enter alias name for new account:" 10 50 3>&1 1>&2 2>&3) || continue
+        if [[ -n "${new_alias}" ]]; then
+          "${tui_cmd}" --title "Adding Account" --infobox "Opening browser login for '${new_alias}'..." 5 50
+          local add_output
+          add_output="$(cmd_add "${new_alias}" 2>&1)"
+          "${tui_cmd}" --title "Add Account" --msgbox "${add_output}" "${height}" "${width}"
+        fi
+        ;;
+      refresh)
+        "${tui_cmd}" --title "Refresh" --infobox "Refreshing all tokens..." 5 40
+        local refresh_output
+        refresh_output=$(cmd_refresh 2>&1)
+        "${tui_cmd}" --title "Refresh Results" --msgbox "${refresh_output}" "${height}" "${width}"
+        ;;
+      doctor)
+        local doc_output
+        doc_output=$(cmd_doctor 2>&1)
+        "${tui_cmd}" --title "System Diagnostics" --msgbox "${doc_output}" "${height}" 90
+        ;;
+      cooldown)
+        local cd_items=()
+        if [[ -f "${ORDER_FILE}" ]]; then
+          while IFS= read -r alias_name; do
+            [[ -z "${alias_name}" ]] && continue
+            cd_items+=("${alias_name}" "Manage cooldown")
+          done < "${ORDER_FILE}"
+        fi
+        if [[ ${#cd_items[@]} -eq 0 ]]; then
+          "${tui_cmd}" --title "Cooldown" --msgbox "No accounts." 8 40
+        else
+          local cd_selected
+          cd_selected=$("${tui_cmd}" --title "Cooldown Management" \
+            --menu "Select account:" "${height}" "${width}" "${menu_height}" \
+            "${cd_items[@]}" 3>&1 1>&2 2>&3) || continue
+          local cd_action
+          cd_action=$("${tui_cmd}" --title "Cooldown: ${cd_selected}" \
+            --menu "Action:" 12 50 3 \
+            "cooldown" "Set cooldown (1 hour)" \
+            "uncooldown" "Clear cooldown" \
+            "back" "Go back" \
+            3>&1 1>&2 2>&3) || continue
+          case "${cd_action}" in
+            cooldown)
+              cmd_cooldown "${cd_selected}" >/dev/null 2>&1 || true
+              "${tui_cmd}" --msgbox "Cooldown set for ${cd_selected}" 8 40
+              ;;
+            uncooldown)
+              cmd_uncooldown "${cd_selected}" >/dev/null 2>&1 || true
+              "${tui_cmd}" --msgbox "Cooldown cleared for ${cd_selected}" 8 40
+              ;;
+          esac
+        fi
+        ;;
+      help)
+        "${tui_cmd}" --title "Help" --msgbox "$(cmd_help 2>&1)" "${height}" 90
+        ;;
+      exit|"")
+        break
+        ;;
+    esac
+  done
+}
+
 cmd_help() {
   cat <<EOF
 ${SCRIPT_NAME} v${SCRIPT_VERSION}
@@ -1928,7 +2804,7 @@ Commands:
   init
       Initialize ~/.codex-accounts structure and default config.
 
-  add <alias> [--force]
+  add <alias> [--force] [--group=<name>]
       Interactive login flow to add account credentials under alias.
 
   import <alias> <path>
@@ -1952,6 +2828,9 @@ Commands:
   auto [codex args...]
       Same as run, but pre-rotates if last_used exceeds ROTATION_INTERVAL.
 
+  Options for run/auto:
+    --group=<name>   Only rotate among accounts in specified group.
+
   cooldown <alias> [--hours N | --days N | --weeks N]
       Manually put account on cooldown (default: 1 hour).
 
@@ -1968,8 +2847,28 @@ Commands:
       Refresh access tokens using stored refresh_token.
       Without args or with --all, refreshes all accounts.
 
+  doctor
+      Run system diagnostics (check dependencies, permissions, tokens).
+
+  upgrade
+      Check for updates and upgrade to the latest version via npm.
+
+  tui
+      Interactive terminal menu (requires whiptail or dialog).
+
+  group <set|unset|list> [args]
+      Manage account groups.
+      set <alias> <group>   — assign account to a group
+      unset <alias>         — remove group assignment
+      list                  — show all groups and members
+
   help
       Show this help.
+
+  Notifications (configure in ~/.codex-accounts/config.sh):
+    NOTIFY_DESKTOP=1              Enable desktop notifications
+    NOTIFY_WEBHOOK_URL="..."      Webhook URL (Slack, Discord, etc.)
+    NOTIFY_WEBHOOK_TYPE="slack"   Type: slack, discord, telegram, generic
 
 Notes:
   - Credentials are stored at: ${CREDENTIALS_DIR}/<alias>.json
@@ -1997,6 +2896,8 @@ dispatch_internal() {
     __internal_auto_preflight) internal_auto_preflight "$@" ;;
     __internal_cooldown) internal_cooldown "$@" ;;
     __internal_uncooldown) internal_uncooldown "$@" ;;
+    __internal_group_set) internal_group_set "$@" ;;
+    __internal_group_unset) internal_group_unset "$@" ;;
     *) die "Unknown internal subcommand: ${subcmd}" ;;
   esac
 }
@@ -2034,6 +2935,10 @@ main() {
     quota) cmd_quota "$@" ;;
     email) cmd_email "$@" ;;
     refresh) cmd_refresh "$@" ;;
+    doctor) cmd_doctor ;;
+    upgrade) cmd_upgrade ;;
+    tui) cmd_tui ;;
+    group) cmd_group "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
       log_error "Unknown command: ${cmd}"

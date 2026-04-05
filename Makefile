@@ -1,7 +1,10 @@
 PREFIX ?= /usr/local
 INSTALL_DIR ?= $(HOME)/.local/bin
+BASH_COMPLETION_DIR ?= $(HOME)/.local/share/bash-completion/completions
+ZSH_COMPLETION_DIR ?= $(HOME)/.local/share/zsh/site-functions
+FISH_COMPLETION_DIR ?= $(HOME)/.config/fish/completions
 
-.PHONY: install uninstall lint test clean help
+.PHONY: install uninstall install-completions lint test clean help
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -11,10 +14,25 @@ install: ## Install codex-rotate to ~/.local/bin
 	@cp bin/codex-rotate $(INSTALL_DIR)/codex-rotate
 	@chmod +x $(INSTALL_DIR)/codex-rotate
 	@echo "Installed codex-rotate to $(INSTALL_DIR)/codex-rotate"
+	@$(MAKE) install-completions
+
+install-completions: ## Install shell completions (bash/zsh/fish)
+	@mkdir -p $(BASH_COMPLETION_DIR) 2>/dev/null && \
+		cp completions/codex-rotate.bash $(BASH_COMPLETION_DIR)/codex-rotate && \
+		echo "Installed bash completion" || true
+	@mkdir -p $(ZSH_COMPLETION_DIR) 2>/dev/null && \
+		cp completions/codex-rotate.zsh $(ZSH_COMPLETION_DIR)/_codex-rotate && \
+		echo "Installed zsh completion" || true
+	@mkdir -p $(FISH_COMPLETION_DIR) 2>/dev/null && \
+		cp completions/codex-rotate.fish $(FISH_COMPLETION_DIR)/codex-rotate.fish && \
+		echo "Installed fish completion" || true
 
 uninstall: ## Remove codex-rotate from ~/.local/bin
 	@rm -f $(INSTALL_DIR)/codex-rotate
-	@echo "Removed codex-rotate from $(INSTALL_DIR)/codex-rotate"
+	@rm -f $(BASH_COMPLETION_DIR)/codex-rotate
+	@rm -f $(ZSH_COMPLETION_DIR)/_codex-rotate
+	@rm -f $(FISH_COMPLETION_DIR)/codex-rotate.fish
+	@echo "Removed codex-rotate and completions"
 
 lint: ## Run ShellCheck on all scripts
 	shellcheck bin/codex-rotate
