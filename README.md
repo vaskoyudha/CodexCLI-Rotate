@@ -101,6 +101,7 @@ work                 work@company.com                    team
 ## Features
 
 - 🔄 **Auto-rotation** — Detects `429`, `usageLimitExceeded`, and other rate-limit signals to instantly swap accounts.
+- 👹 **Background daemon** — `daemon start` monitors Codex logs and quota API in the background. Auto-swaps `auth.json` when rate limits are hit — works with any launcher (omx, codex, codex-rotate run).
 - ⏰ **Time-based rotation** — Optionally rotate accounts every N hours to balance usage across your fleet.
 - 📊 **Real-time quota checking** — Query OpenAI's usage API to see 5-hour and weekly usage with colored progress bars.
 - 📧 **Email & plan display** — Extract and show email addresses and plan types from account JWT tokens.
@@ -189,6 +190,7 @@ brew install codex-rotate
 | `doctor` | Run system diagnostics | `codex-rotate doctor` |
 | `upgrade` | Check for updates and upgrade via npm | `codex-rotate upgrade` |
 | `tui` | Interactive terminal menu | `codex-rotate tui` |
+| `daemon` | Background rate-limit monitor | `codex-rotate daemon start` |
 | `group` | Manage account groups | `codex-rotate group set my-acc work` |
 | `cooldown` | Manually mark account as cooling down | `codex-rotate cooldown my-acc` |
 | `uncooldown` | Clear cooldown status for an account | `codex-rotate uncooldown my-acc` |
@@ -218,9 +220,10 @@ brew install codex-rotate
 ```
 
 1. **Transparent Wrapper** — `codex-rotate run` wraps the official Codex CLI, passing all arguments directly.
-2. **Signal Monitoring** — Monitors `stderr` for rate-limit signals (`429`, `usageLimitExceeded`, `rate limit`).
-3. **Atomic Swap** — Swaps the `~/.codex/auth.json` symlink to the next available account.
-4. **Auto-Retry** — Retries the command with the new account (up to `MAX_RETRIES`).
+2. **Signal Monitoring** — Monitors `stderr` for rate-limit signals (`429`, `usageLimitExceeded`, `usage limit`, `rate limit`).
+3. **Background Daemon** — `codex-rotate daemon start` watches the Codex TUI log (`~/.codex/log/codex-tui.log`) and polls the quota API every 30s. When rate limits are detected or quota exceeds the threshold, it auto-swaps `auth.json` — no wrapper needed.
+4. **Atomic Swap** — Swaps the `~/.codex/auth.json` symlink to the next available account.
+5. **Auto-Retry** — Retries the command with the new account (up to `MAX_RETRIES`).
 
 ## Configuration
 
@@ -234,6 +237,9 @@ WEEKLY_COOLDOWN=604800    # Cooldown for weekly rate limit (7 days)
 MAX_RETRIES=3             # Max retries after rate limit
 QUOTA_AWARE_ROTATION=0    # Set to 1 for usage-based rotation (auto mode enables this)
 CODEX_BIN=""              # Path to codex binary (auto-detected if empty)
+DAEMON_CHECK_INTERVAL=30  # Seconds between daemon quota/log checks
+DAEMON_QUOTA_THRESHOLD=90 # Usage percent to trigger proactive rotation
+CODEX_LOG_PATH=""         # Path to codex TUI log (auto-detected if empty)
 NOTIFY_DESKTOP=0          # Set to 1 to enable desktop notifications on rotation
 NOTIFY_WEBHOOK_URL=""     # Webhook URL for Slack, Discord, or Telegram
 NOTIFY_WEBHOOK_TYPE=""    # Type: slack, discord, telegram, or generic
@@ -256,6 +262,34 @@ codex-rotate group list
 codex-rotate run --group=work exec "Refactor the API"
 codex-rotate auto --group=personal exec "Write tests"
 ```
+
+## Background Daemon
+
+The daemon monitors your Codex usage in the background and automatically rotates accounts when rate limits are hit — no wrapper needed. Works with any launcher: `omx`, `codex`, or `codex-rotate run`.
+
+```bash
+# Start the daemon
+codex-rotate daemon start
+# [OK] Daemon started (PID: 12345)
+# [INFO] Monitoring codex log and quota API every 30s
+# [INFO] Quota rotation threshold: 90%
+
+# Check status
+codex-rotate daemon status
+
+# View rotation history
+codex-rotate daemon logs
+
+# Stop the daemon
+codex-rotate daemon stop
+```
+
+**How it works:**
+1. **Log watcher** — Tails `~/.codex/log/codex-tui.log` for rate-limit error messages
+2. **Quota poller** — Calls the OpenAI usage API every `DAEMON_CHECK_INTERVAL` seconds
+3. When either detects a rate limit (or quota ≥ `DAEMON_QUOTA_THRESHOLD`%), it marks the current account on cooldown, swaps `auth.json` to the next available account, and sends a notification
+
+> **Tip**: Add `codex-rotate daemon start` to your shell startup (`.bashrc`/`.zshrc`) for always-on rotation.
 
 ## JSON Output
 

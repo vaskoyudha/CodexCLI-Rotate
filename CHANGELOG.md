@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2025-04-06
+
+### Added
+- **`daemon` command** — Background process that monitors Codex TUI logs and OpenAI quota API for rate-limit detection. Automatically rotates accounts by swapping `auth.json` symlink when limits are hit — works with any launcher (omx, codex, codex-rotate run).
+  - `daemon start` — start background daemon
+  - `daemon stop` — stop running daemon
+  - `daemon status` — show daemon status and rotation history
+  - `daemon logs [N]` — show last N daemon log entries
+- Dual detection: log file watcher (instant) + quota API polling (proactive)
+- Config variables: `DAEMON_CHECK_INTERVAL`, `DAEMON_QUOTA_THRESHOLD`, `CODEX_LOG_PATH`
+- Shell completions for `daemon` subcommands (bash, zsh, fish)
+
+### Fixed
+- **Rate limit detection regex** — Added `usage limit` and `you've hit` patterns to match actual Codex CLI error: "You've hit your usage limit". Previously only matched "you've reached" and missed the real error message.
+
 ## [1.2.0] - 2025-04-05
 
 ### Added

@@ -8,6 +8,18 @@ setup() {
 }
 
 teardown() {
+  # Kill any leftover daemon processes spawned by tests
+  local pidfile="$BATS_TEST_TMPDIR/fakehome/.codex-accounts/daemon.pid"
+  if [[ -f "$pidfile" ]]; then
+    local pid
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      sleep 0.1
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
   rm -rf "$BATS_TEST_TMPDIR/fakehome"
 }
 

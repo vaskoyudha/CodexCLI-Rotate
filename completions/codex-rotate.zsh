@@ -32,6 +32,7 @@ _codex_rotate() {
         'doctor:Run system diagnostics'
         'upgrade:Check for updates'
         'tui:Interactive menu'
+        'daemon:Background rate-limit monitor'
         'help:Show help'
     )
 
@@ -63,6 +64,10 @@ _codex_rotate() {
                     _arguments \
                         '2:alias:' \
                         '3:auth file:_files -g "*.json"'
+                    ;;
+                daemon)
+                    _alternative \
+                        'subcommands:subcommand:(start stop status logs)'
                     ;;
             esac
             ;;

@@ -1495,3 +1495,105 @@ MOCKCURL
   run codex-rotate help
   assert_output_contains "NOTIFY_DESKTOP" || assert_output_contains "Notification"
 }
+
+# ── Daemon ──
+
+_daemon_cleanup() {
+  local pidfile="$HOME/.codex-accounts/daemon.pid"
+  if [[ -f "$pidfile" ]]; then
+    local pid
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      sleep 0.2
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
+_daemon_setup() {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  echo "DAEMON_CHECK_INTERVAL=1" >> "$HOME/.codex-accounts/config.sh"
+}
+
+@test "daemon status reports not running when no daemon" {
+  _daemon_setup
+  run codex-rotate daemon status
+  assert_output_contains "not running"
+}
+
+@test "daemon start creates PID file and starts process" {
+  _daemon_setup
+  run codex-rotate daemon start
+  assert_success
+  assert_output_contains "Daemon started"
+  [ -f "$HOME/.codex-accounts/daemon.pid" ]
+  local pid
+  pid=$(cat "$HOME/.codex-accounts/daemon.pid")
+  kill -0 "$pid" 2>/dev/null
+  _daemon_cleanup
+}
+
+@test "daemon status reports running after start" {
+  _daemon_setup
+  run codex-rotate daemon start
+  assert_success
+  sleep 0.2
+  run codex-rotate daemon status
+  assert_success
+  assert_output_contains "running"
+  _daemon_cleanup
+}
+
+@test "daemon stop kills running daemon" {
+  _daemon_setup
+  run codex-rotate daemon start
+  assert_success
+  sleep 0.2
+  local pid
+  pid=$(cat "$HOME/.codex-accounts/daemon.pid")
+  run codex-rotate daemon stop
+  assert_success
+  assert_output_contains "stopped"
+  ! kill -0 "$pid" 2>/dev/null || true
+}
+
+@test "daemon stop fails when not running" {
+  _daemon_setup
+  run codex-rotate daemon stop
+  assert_failure
+}
+
+@test "daemon logs shows empty message when no log" {
+  _daemon_setup
+  run codex-rotate daemon logs
+  assert_success
+}
+
+@test "daemon start refuses if already running" {
+  _daemon_setup
+  run codex-rotate daemon start
+  assert_success
+  sleep 0.2
+  run codex-rotate daemon start
+  assert_failure
+  assert_output_contains "already running"
+  _daemon_cleanup
+}
+
+@test "help includes daemon command" {
+  run codex-rotate help
+  assert_output_contains "daemon"
+}
+
+@test "config includes daemon settings after init" {
+  _install_fake_codex
+  run codex-rotate init
+  assert_success
+  run cat "$HOME/.codex-accounts/config.sh"
+  assert_output_contains "DAEMON_CHECK_INTERVAL"
+  assert_output_contains "DAEMON_QUOTA_THRESHOLD"
+}

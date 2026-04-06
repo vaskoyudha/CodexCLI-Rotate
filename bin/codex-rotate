@@ -15,7 +15,7 @@ set -euo pipefail
 ###############################################################################
 
 SCRIPT_NAME="codex-rotate"
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 
 HOME_DIR="${HOME:?HOME environment variable must be set}"
 ACCOUNTS_DIR="${HOME_DIR}/.codex-accounts"
@@ -26,6 +26,8 @@ ACTIVE_FILE="${ACCOUNTS_DIR}/active"
 CREDENTIALS_DIR="${ACCOUNTS_DIR}/credentials"
 LOCK_DIR="${ACCOUNTS_DIR}/locks"
 LOCK_FILE="${LOCK_DIR}/state.lock"
+DAEMON_PID_FILE="${ACCOUNTS_DIR}/daemon.pid"
+DAEMON_LOG_FILE="${ACCOUNTS_DIR}/daemon.log"
 
 # Honor CODEX_HOME if explicitly set by user.
 if [[ -n "${CODEX_HOME:-}" ]]; then
@@ -52,6 +54,9 @@ QUOTA_AWARE_ROTATION=0
 NOTIFY_DESKTOP=0
 NOTIFY_WEBHOOK_URL=""
 NOTIFY_WEBHOOK_TYPE=""
+DAEMON_CHECK_INTERVAL=30
+DAEMON_QUOTA_THRESHOLD=90
+CODEX_LOG_PATH=""
 
 ###############################################################################
 # ANSI colors and output helpers
@@ -291,6 +296,12 @@ load_config() {
   if [[ "${CODEX_ROTATE__QUOTA_AWARE:-}" == "1" ]]; then
     QUOTA_AWARE_ROTATION=1
   fi
+  if [[ -z "${CODEX_LOG_PATH}" ]]; then
+    local codex_log_dir="${CODEX_DIR}/log"
+    if [[ -f "${codex_log_dir}/codex-tui.log" ]]; then
+      CODEX_LOG_PATH="${codex_log_dir}/codex-tui.log"
+    fi
+  fi
   resolve_codex_bin
 }
 
@@ -311,6 +322,9 @@ QUOTA_AWARE_ROTATION=0         # Set to 1 to prefer lowest-usage account in 'aut
 NOTIFY_DESKTOP=0               # Set to 1 to enable desktop notifications
 NOTIFY_WEBHOOK_URL=""          # Webhook URL (Slack, Discord, etc.)
 NOTIFY_WEBHOOK_TYPE=""         # Type: slack, discord, telegram, generic
+DAEMON_CHECK_INTERVAL=30       # Seconds between daemon quota/log checks
+DAEMON_QUOTA_THRESHOLD=90      # Percent usage to trigger proactive rotation
+CODEX_LOG_PATH=""              # Path to codex TUI log (auto-detected if empty)
 EOF
   mv -f "${tmp}" "${CONFIG_FILE}"
 }
@@ -670,9 +684,9 @@ validate_symlink() {
 ###############################################################################
 
 rate_limit_regex() {
-  printf '%s' 'usageLimitExceeded|responseTooManyFailedAttempts|429|rate[[:space:]-]*limit|too[[:space:]]+many[[:space:]]+requests|usage[[:space:]]+cap|account/rateLimits/updated|you'
+  printf '%s' 'usageLimitExceeded|responseTooManyFailedAttempts|429|rate[[:space:]-]*limit|too[[:space:]]+many[[:space:]]+requests|usage[[:space:]]+cap|usage[[:space:]]+limit|account/rateLimits/updated|you'
   printf "'"
-  printf '%s' 've[[:space:]]+reached|capacity|try[[:space:]]+again[[:space:]]+later|limit[[:space:]]+exceeded'
+  printf '%s' 've[[:space:]]+reached|ve[[:space:]]+hit|capacity|try[[:space:]]+again[[:space:]]+later|limit[[:space:]]+exceeded'
 }
 
 detect_rate_limit() {
@@ -2791,6 +2805,250 @@ cmd_tui() {
   done
 }
 
+###############################################################################
+# Daemon — background log watcher + quota poller
+###############################################################################
+
+daemon_log() {
+  printf "[%s] %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*" >> "${DAEMON_LOG_FILE}"
+}
+
+daemon_get_log_size() {
+  # Cross-platform file size (Linux stat -c%s, macOS stat -f%z)
+  local file="$1"
+  [[ -f "${file}" ]] || { printf "0"; return 0; }
+  stat -c%s "${file}" 2>/dev/null || stat -f%z "${file}" 2>/dev/null || printf "0"
+}
+
+daemon_loop() {
+  local log_file="${CODEX_LOG_PATH}"
+  local last_size=0
+  local last_rotate_epoch=0
+  local min_rotate_gap=10  # Minimum seconds between rotations
+
+  # Get initial log size (skip existing content)
+  if [[ -n "${log_file}" && -f "${log_file}" ]]; then
+    last_size="$(daemon_get_log_size "${log_file}")"
+  fi
+
+  daemon_log "Daemon loop started (interval=${DAEMON_CHECK_INTERVAL}s, threshold=${DAEMON_QUOTA_THRESHOLD}%, log=${log_file:-none})"
+
+  while true; do
+    load_config
+    local active
+    active="$(get_active)"
+
+    if [[ -z "${active}" ]]; then
+      sleep "${DAEMON_CHECK_INTERVAL}"
+      continue
+    fi
+
+    local need_rotate=0
+    local rotate_reason=""
+    local now_ep
+    now_ep="$(now_epoch)"
+
+    # Prevent rapid-fire rotations
+    if (( now_ep - last_rotate_epoch < min_rotate_gap )); then
+      sleep "${DAEMON_CHECK_INTERVAL}"
+      continue
+    fi
+
+    # --- Detection method 1: Log watcher ---
+    if [[ -n "${log_file}" && -f "${log_file}" ]]; then
+      local current_size
+      current_size="$(daemon_get_log_size "${log_file}")"
+
+      if (( current_size < last_size )); then
+        # Log file was rotated/truncated — reset
+        last_size=0
+      fi
+
+      if (( current_size > last_size )); then
+        local new_bytes=$(( current_size - last_size ))
+        local new_content
+        new_content="$(tail -c "${new_bytes}" "${log_file}" 2>/dev/null || true)"
+
+        local regex
+        regex="$(rate_limit_regex)"
+        if printf "%s" "${new_content}" | grep -qiE "${regex}" 2>/dev/null; then
+          need_rotate=1
+          rotate_reason="Rate limit detected in codex log"
+        fi
+      fi
+      last_size="${current_size}"
+    fi
+
+    # --- Detection method 2: Quota API poller ---
+    if (( need_rotate == 0 )) && command -v curl >/dev/null 2>&1; then
+      local usage_json pct
+      usage_json="$(query_usage_api "${active}" 2>/dev/null || true)"
+      if [[ -n "${usage_json}" && "${usage_json}" != ERROR:* ]]; then
+        pct="$(parse_usage_percent "${usage_json}")"
+        pct="${pct:-0}"
+        pct="${pct%%.*}"
+        if [[ "${pct}" =~ ^[0-9]+$ ]] && (( pct >= DAEMON_QUOTA_THRESHOLD )); then
+          need_rotate=1
+          rotate_reason="Quota at ${pct}% (threshold: ${DAEMON_QUOTA_THRESHOLD}%)"
+        fi
+      fi
+    fi
+
+    # --- Rotate if needed ---
+    if (( need_rotate == 1 )); then
+      daemon_log "⚠ ${rotate_reason} on account '${active}'"
+
+      local cd_seconds="${HOURLY_COOLDOWN}"
+      local lock_cmd
+      lock_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_mark_rate_limit" "${active}" "${cd_seconds}")
+      with_lock "${lock_cmd}"
+
+      local next
+      next="$(get_next_available)"
+
+      if [[ -n "${next}" && "${next}" != "${active}" ]]; then
+        local switch_cmd
+        switch_cmd=$(printf '%q ' "${BASH_SOURCE[0]}" "__internal_switch" "${next}")
+        with_lock "${switch_cmd}"
+        last_rotate_epoch="$(now_epoch)"
+        daemon_log "✓ Rotated: '${active}' → '${next}'"
+        send_notification "codex-rotate daemon" "Rotated from '${active}' to '${next}' (${rotate_reason})"
+      else
+        daemon_log "✗ No alternate account available"
+        send_notification "codex-rotate daemon" "Rate limit on '${active}' but no alternate account available"
+      fi
+    fi
+
+    sleep "${DAEMON_CHECK_INTERVAL}"
+  done
+}
+
+daemon_start() {
+  # Check if already running
+  if [[ -f "${DAEMON_PID_FILE}" ]]; then
+    local existing_pid
+    existing_pid="$(cat "${DAEMON_PID_FILE}" 2>/dev/null || true)"
+    if [[ -n "${existing_pid}" ]] && kill -0 "${existing_pid}" 2>/dev/null; then
+      die "Daemon already running (PID: ${existing_pid}). Use '${SCRIPT_NAME} daemon stop' first."
+    fi
+    # Stale PID file — clean up
+    rm -f "${DAEMON_PID_FILE}"
+  fi
+
+  # Ensure log file exists
+  touch "${DAEMON_LOG_FILE}"
+
+  # Fork the daemon loop into background
+  nohup "${BASH_SOURCE[0]}" "__internal_daemon_loop" >/dev/null 2>&1 &
+  local pid=$!
+  printf "%s" "${pid}" > "${DAEMON_PID_FILE}"
+
+  daemon_log "Daemon started (PID: ${pid})"
+  log_success "Daemon started (PID: ${pid})"
+  log_info "Monitoring codex log and quota API every ${DAEMON_CHECK_INTERVAL}s"
+  log_info "Quota rotation threshold: ${DAEMON_QUOTA_THRESHOLD}%"
+  if [[ -n "${CODEX_LOG_PATH}" ]]; then
+    log_info "Watching log: ${CODEX_LOG_PATH}"
+  else
+    log_warn "No codex log found — using quota API polling only"
+  fi
+  log_info "Daemon log: ${DAEMON_LOG_FILE}"
+}
+
+daemon_stop() {
+  if [[ ! -f "${DAEMON_PID_FILE}" ]]; then
+    die "Daemon is not running (no PID file found)"
+  fi
+
+  local pid
+  pid="$(cat "${DAEMON_PID_FILE}" 2>/dev/null || true)"
+
+  if [[ -z "${pid}" ]]; then
+    rm -f "${DAEMON_PID_FILE}"
+    die "Daemon PID file was empty. Cleaned up."
+  fi
+
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill "${pid}" 2>/dev/null || true
+    # Wait briefly for process to die
+    local i
+    for (( i=0; i<10; i++ )); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 0.2
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill -9 "${pid}" 2>/dev/null || true
+    fi
+    daemon_log "Daemon stopped (PID: ${pid})"
+    log_success "Daemon stopped (PID: ${pid})"
+  else
+    log_warn "Daemon process (PID: ${pid}) was not running. Cleaning up PID file."
+  fi
+
+  rm -f "${DAEMON_PID_FILE}"
+}
+
+daemon_status() {
+  if [[ -f "${DAEMON_PID_FILE}" ]]; then
+    local pid
+    pid="$(cat "${DAEMON_PID_FILE}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      log_success "Daemon is running (PID: ${pid})"
+      log_info "Check interval: ${DAEMON_CHECK_INTERVAL}s"
+      log_info "Quota threshold: ${DAEMON_QUOTA_THRESHOLD}%"
+      if [[ -n "${CODEX_LOG_PATH}" && -f "${CODEX_LOG_PATH}" ]]; then
+        log_info "Watching log: ${CODEX_LOG_PATH}"
+      else
+        log_info "Log watching: disabled (no log found)"
+      fi
+      log_info "Daemon log: ${DAEMON_LOG_FILE}"
+
+      # Show recent rotations from log
+      if [[ -f "${DAEMON_LOG_FILE}" ]]; then
+        local recent
+        recent="$(grep -c "Rotated:" "${DAEMON_LOG_FILE}" 2>/dev/null || echo 0)"
+        log_info "Total rotations performed: ${recent}"
+      fi
+      return 0
+    else
+      log_warn "Daemon PID file exists but process (PID: ${pid}) is not running"
+      rm -f "${DAEMON_PID_FILE}"
+      return 1
+    fi
+  else
+    log_info "Daemon is not running"
+    return 1
+  fi
+}
+
+daemon_logs() {
+  if [[ ! -f "${DAEMON_LOG_FILE}" ]]; then
+    log_info "No daemon log file found"
+    return 0
+  fi
+
+  local lines="${1:-20}"
+  tail -n "${lines}" "${DAEMON_LOG_FILE}"
+}
+
+cmd_daemon() {
+  require_initialized
+  load_config
+
+  local subcmd="${1:-status}"
+  shift || true
+
+  case "${subcmd}" in
+    start)  daemon_start ;;
+    stop)   daemon_stop ;;
+    status) daemon_status ;;
+    logs)   daemon_logs "$@" ;;
+    *)
+      die "Usage: ${SCRIPT_NAME} daemon {start|stop|status|logs [N]}"
+      ;;
+  esac
+}
+
 cmd_help() {
   cat <<EOF
 ${SCRIPT_NAME} v${SCRIPT_VERSION}
@@ -2862,6 +3120,14 @@ Commands:
       unset <alias>         — remove group assignment
       list                  — show all groups and members
 
+  daemon {start|stop|status|logs}
+      Background monitor that watches codex logs and quota API.
+      Automatically rotates accounts when rate limits are detected.
+      start        — start daemon in background
+      stop         — stop running daemon
+      status       — show daemon status and stats
+      logs [N]     — show last N daemon log lines (default: 20)
+
   help
       Show this help.
 
@@ -2869,6 +3135,9 @@ Commands:
     NOTIFY_DESKTOP=1              Enable desktop notifications
     NOTIFY_WEBHOOK_URL="..."      Webhook URL (Slack, Discord, etc.)
     NOTIFY_WEBHOOK_TYPE="slack"   Type: slack, discord, telegram, generic
+    DAEMON_CHECK_INTERVAL=30      Seconds between daemon checks
+    DAEMON_QUOTA_THRESHOLD=90     Usage percent to trigger rotation
+    CODEX_LOG_PATH=""             Codex log path (auto-detected)
 
 Notes:
   - Credentials are stored at: ${CREDENTIALS_DIR}/<alias>.json
@@ -2894,6 +3163,7 @@ dispatch_internal() {
     __internal_increment_use) internal_increment_use "$@" ;;
     __internal_ensure_active_ready) internal_ensure_active_ready "$@" ;;
     __internal_auto_preflight) internal_auto_preflight "$@" ;;
+    __internal_daemon_loop) daemon_loop "$@" ;;
     __internal_cooldown) internal_cooldown "$@" ;;
     __internal_uncooldown) internal_uncooldown "$@" ;;
     __internal_group_set) internal_group_set "$@" ;;
@@ -2939,6 +3209,7 @@ main() {
     upgrade) cmd_upgrade ;;
     tui) cmd_tui ;;
     group) cmd_group "$@" ;;
+    daemon) cmd_daemon "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
       log_error "Unknown command: ${cmd}"

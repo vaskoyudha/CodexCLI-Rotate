@@ -2,7 +2,7 @@ _codex_rotate() {
     local cur words cword
     _init_completion || return
 
-    local commands="init add import remove list switch status run auto cooldown uncooldown quota email refresh doctor upgrade tui help"
+    local commands="init add import remove list switch status run auto cooldown uncooldown quota email refresh doctor upgrade tui daemon help"
 
     local alias_commands="remove switch cooldown uncooldown quota email refresh"
 
@@ -50,6 +50,9 @@ _codex_rotate() {
             if [[ ${cword} -eq 3 ]]; then
                 _filedir json
             fi
+            ;;
+        daemon)
+            mapfile -t COMPREPLY < <(compgen -W "start stop status logs" -- "${cur}")
             ;;
     esac
 }
