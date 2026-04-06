@@ -885,10 +885,10 @@ MOCKCURL
   assert_output_contains "resets in"
 }
 
-@test "help output reports version 1.2.0" {
+@test "help output reports version 1.3.0" {
   run codex-rotate help
   assert_success
-  assert_output_contains "1.2.0"
+  assert_output_contains "1.3.0"
 }
 
 # ---------------------------------------------------------------------------
@@ -1230,10 +1230,10 @@ MOCKCURL
   [ "$active_after" = "low_usage" ]
 }
 
-@test "version in help matches 1.2.0" {
+@test "version in help matches 1.3.0" {
   run codex-rotate help
   assert_success
-  assert_output_contains "1.2.0"
+  assert_output_contains "1.3.0"
 }
 
 # ---------------------------------------------------------------------------
