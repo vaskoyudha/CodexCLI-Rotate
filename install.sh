@@ -4,7 +4,7 @@ set -euo pipefail
 # codex-rotate installer
 # Supports both local (git clone) and remote (curl | bash) installation.
 
-REPO_URL="https://raw.githubusercontent.com/vaskoyudha/MultipleAccountCodex/main"
+REPO_URL="https://raw.githubusercontent.com/vaskoyudha/CodexCLI-Rotate/main"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${HOME}/.local/bin"
 TARGET_SCRIPT="${INSTALL_DIR}/codex-rotate"

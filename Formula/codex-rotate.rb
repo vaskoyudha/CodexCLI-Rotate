@@ -1,7 +1,7 @@
 class CodexRotate < Formula
   desc "Multi-account manager for Codex CLI with automatic rotation on rate limits"
-  homepage "https://github.com/vaskoyudha/MultipleAccountCodex"
-  url "https://github.com/vaskoyudha/MultipleAccountCodex/archive/refs/tags/v1.2.0.tar.gz"
+  homepage "https://github.com/vaskoyudha/CodexCLI-Rotate"
+  url "https://github.com/vaskoyudha/CodexCLI-Rotate/archive/refs/tags/v1.3.0.tar.gz"
   # sha256 will be updated after release
   # sha256 "PLACEHOLDER"
   license "MIT"

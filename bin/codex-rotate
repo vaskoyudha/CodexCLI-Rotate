@@ -959,9 +959,9 @@ query_usage_api() {
 }
 
 refresh_account_token() {
-  # Refresh tokens for a given account using refresh_token.
-  # Updates the credential file in-place on success.
-  # Returns: 0 on success, 1 on failure.
+# Refresh tokens for a given account using refresh_token.
+# Updates the credential file in-place on success.
+# Returns: 0 on success, 1 on failure.
   local alias="$1"
   local cred_file="${CREDENTIALS_DIR}/${alias}.json"
   [[ -f "${cred_file}" ]] || return 1
@@ -2647,7 +2647,7 @@ cmd_upgrade() {
   log_info "Update available: v${current} → v${latest}"
 
   # Fetch changelog summary if available
-  local changelog_url="https://raw.githubusercontent.com/vaskoyudha/MultipleAccountCodex/main/CHANGELOG.md"
+  local changelog_url="https://raw.githubusercontent.com/vaskoyudha/CodexCLI-Rotate/main/CHANGELOG.md"
   local changelog
   changelog=$(curl -fsSL "${changelog_url}" 2>/dev/null || echo "")
   if [[ -n "${changelog}" ]]; then

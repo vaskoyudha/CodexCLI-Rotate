@@ -11,7 +11,7 @@
 If you discover a security vulnerability in codex-rotate, please report it responsibly:
 
 1. **Do not** open a public GitHub issue for security vulnerabilities
-2. Email your findings or open a [private security advisory](https://github.com/vaskoyudha/MultipleAccountCodex/security/advisories/new)
+2. Email your findings or open a [private security advisory](https://github.com/vaskoyudha/CodexCLI-Rotate/security/advisories/new)
 3. Include steps to reproduce the vulnerability
 4. Allow reasonable time for a fix before public disclosure
 

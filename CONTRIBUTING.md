@@ -4,12 +4,12 @@ Thank you for your interest in contributing! We welcome bug reports, feature req
 
 ## Reporting Issues
 
-- **Bugs**: Open an [issue](https://github.com/vaskoyudha/MultipleAccountCodex/issues) with a clear description, steps to reproduce, and expected vs. actual behavior.
+- **Bugs**: Open an [issue](https://github.com/vaskoyudha/CodexCLI-Rotate/issues) with a clear description, steps to reproduce, and expected vs. actual behavior.
 - **Security**: See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## Suggesting Features
 
-Open an [issue](https://github.com/vaskoyudha/MultipleAccountCodex/issues) with:
+Open an [issue](https://github.com/vaskoyudha/CodexCLI-Rotate/issues) with:
 - Use case and motivation
 - Proposed behavior
 - Examples
@@ -17,8 +17,8 @@ Open an [issue](https://github.com/vaskoyudha/MultipleAccountCodex/issues) with:
 ## Development Setup
 
 ```bash
-git clone https://github.com/vaskoyudha/MultipleAccountCodex.git
-cd MultipleAccountCodex
+git clone https://github.com/vaskoyudha/CodexCLI-Rotate.git
+cd CodexCLI-Rotate
 ```
 
 ### Dependencies

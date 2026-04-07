@@ -7,11 +7,11 @@
 
 **Multi-account manager for Codex CLI with automatic rotation on rate limits.**
 
-![License](https://img.shields.io/github/license/vaskoyudha/MultipleAccountCodex)
+![License](https://img.shields.io/github/license/vaskoyudha/CodexCLI-Rotate)
 ![NPM Version](https://img.shields.io/npm/v/codex-rotate)
-![GitHub Stars](https://img.shields.io/github/stars/vaskoyudha/MultipleAccountCodex)
-![GitHub Issues](https://img.shields.io/github/issues/vaskoyudha/MultipleAccountCodex)
-![ShellCheck](https://img.shields.io/github/actions/workflow/status/vaskoyudha/MultipleAccountCodex/ci.yml?label=shellcheck)
+![GitHub Stars](https://img.shields.io/github/stars/vaskoyudha/CodexCLI-Rotate)
+![GitHub Issues](https://img.shields.io/github/issues/vaskoyudha/CodexCLI-Rotate)
+![ShellCheck](https://img.shields.io/github/actions/workflow/status/vaskoyudha/CodexCLI-Rotate/ci.yml?label=shellcheck)
 
 ---
 
@@ -152,14 +152,14 @@ npm install -g codex-rotate
 ### curl one-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vaskoyudha/MultipleAccountCodex/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vaskoyudha/CodexCLI-Rotate/main/install.sh | bash
 ```
 
 ### Manual
 
 ```bash
-git clone https://github.com/vaskoyudha/MultipleAccountCodex.git
-cd MultipleAccountCodex
+git clone https://github.com/vaskoyudha/CodexCLI-Rotate.git
+cd CodexCLI-Rotate
 make install
 ```
 

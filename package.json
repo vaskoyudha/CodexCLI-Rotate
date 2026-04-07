@@ -3,11 +3,11 @@
   "version": "1.3.0",
   "description": "Multi-account manager for Codex CLI with automatic rotation on rate limits",
   "author": "Vasco Yudha Nodyatama Sera <vascoyudha1@gmail.com> (https://github.com/vaskoyudha)",
-  "homepage": "https://github.com/vaskoyudha/MultipleAccountCodex",
-  "bugs": "https://github.com/vaskoyudha/MultipleAccountCodex/issues",
+  "homepage": "https://github.com/vaskoyudha/CodexCLI-Rotate",
+  "bugs": "https://github.com/vaskoyudha/CodexCLI-Rotate/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vaskoyudha/MultipleAccountCodex.git"
+    "url": "git+https://github.com/vaskoyudha/CodexCLI-Rotate.git"
   },
   "funding": {
     "type": "github",
