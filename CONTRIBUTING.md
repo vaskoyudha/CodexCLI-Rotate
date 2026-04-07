@@ -46,7 +46,7 @@ bats --version
 
 ```bash
 make lint          # ShellCheck on all scripts
-make test          # BATS test suite (28 tests) — falls back to smoke test if BATS is missing
+make test          # BATS test suite (116 tests) — falls back to smoke test if BATS is missing
 make clean         # Remove build artifacts
 ```
 
