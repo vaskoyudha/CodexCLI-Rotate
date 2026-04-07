@@ -124,6 +124,78 @@ codex-rotate refresh --all
 - **Model compatibility:** ChatGPT-based accounts use model `gpt-5.4`
 - **Token refresh:** Tokens can be refreshed using stored `refresh_token` values
 
+## Hermes Credential Pool Rotation — Bug & Fix
+
+### The Problem
+
+Hermes supports multi-account credential rotation via a `credential_pool` in `~/.hermes/auth.json`. When a 429 rate limit is hit, the agent is supposed to rotate to the next credential and retry. However, with multiple accounts, the rotation would fail silently — the agent would report "Max retries (3) exhausted" and give up.
+
+### Root Cause
+
+The retry loop in `run_agent.py` had `max_retries = 3` hardcoded. The rotation flow per credential costs **2 retry iterations**:
+
+1. **First 429**: Sets `has_retried_429 = True`, increments `retry_count`
+2. **Second 429**: Calls `mark_exhausted_and_rotate()`, swaps credential, does NOT increment `retry_count`
+
+So each credential burns 1 retry slot. With `max_retries=3`, only 3 credentials could be attempted before the agent gave up.
+
+**Compounding factor — shared team plan limits**: OpenAI team accounts share rate limits across all members. If `user-a@team-1` is rate-limited, `user-b@team-1` is also rate-limited. The rotation would cycle through same-team accounts, wasting retry slots on credentials that are guaranteed to fail.
+
+Example with 7 accounts across 3 teams:
+```
+[0] device_code          → team-1 (exhausted)
+[1] seragithub27         → team-1 (exhausted — same team)
+[2] seragithub19         → team-1 (exhausted — same team)
+[3] seravasco1           → team-2 (exhausted — different team, but also hit limit)
+[4] seravasco66          → team-2 (exhausted — same team)
+[5] seravasco2           → team-2 (exhausted — same team)
+[6] vascoyudha1          → team-3 (FRESH — but max_retries=3 gives up before reaching here)
+```
+
+### The Fix
+
+In `run_agent.py`, scale `max_retries` by the credential pool size:
+
+```python
+# Before the retry loop (around line 7370)
+retry_count = 0
+max_retries = 3
+_pool = self._credential_pool
+if _pool is not None:
+    _n_pool = len(_pool.entries())
+    if _n_pool > 1:
+        max_retries = max(max_retries, _n_pool * 2)
+```
+
+With 7 pool entries → `max_retries = 14`, enough to cycle through all accounts including same-team duplicates.
+
+### Applying the Patch
+
+1. Find the retry loop in `run_agent.py` (search for `max_retries = 3` near the streaming API call)
+2. Add the pool-size scaling code immediately after `max_retries = 3`
+3. Restart Hermes: `systemctl --user restart hermes-gateway.service`
+
+### Credential Pool Format (`~/.hermes/auth.json`)
+
+```json
+{
+  "credential_pool": {
+    "openai-codex": [
+      {
+        "label": "account-alias",
+        "access_token": "eyJ...",
+        "refresh_token": "v1.MR...",
+        "expires_at": 1775600000,
+        "status": "fresh",
+        "request_count": 0
+      }
+    ]
+  }
+}
+```
+
+Each entry can have `status`: `fresh`, `exhausted`, or `null`. The pool automatically marks entries as `exhausted` on 429 and rotates to the next `fresh` entry.
+
 ## Troubleshooting
 
 | Problem | Solution |

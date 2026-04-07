@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-04-07
+
+### Fixed
+- **Hermes credential pool rotation: `max_retries` too low** — Hermes hardcoded `max_retries=3` in the agent retry loop (`run_agent.py`). Each credential rotation consumes 2 retry iterations (first 429 sets a flag, second 429 triggers the actual swap), so only ~1-2 rotations could occur before the agent gave up. With 7 accounts across 3 shared team plans, the agent exhausted retries before reaching a working credential. Fixed by scaling retries to pool size: `max_retries = max(3, pool_entries * 2)`. With 7 entries this gives 14 retries — enough to cycle through all accounts including same-team duplicates.
+- **Hermes auth.json stale `exhausted` status** — Previously exhausted credentials in the pool were not reset after their cooldown period, causing the pool to skip still-valid accounts. Reset all pool entries to `fresh` status after confirming cooldown windows had elapsed.
+
+### Added
+- Diagnostic logging (`[POOL-DBG]`) in Hermes `run_agent.py` for credential pool rotation events (temporary — remove after verification)
+- Documentation of the Hermes `max_retries` bug, root cause analysis, and patch instructions in `docs/INFRASTRUCTURE.md`
+- Documentation of shared team plan rate limit behavior and its impact on credential rotation
+
+
 ## [1.3.1] - 2026-04-07
 
 ### Fixed
