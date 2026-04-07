@@ -1,91 +1,135 @@
-# Infrastructure Setup Notes: Multi-Tool AI Coding
+# Multi-Tool Infrastructure Guide
 
-This document serves as operational documentation for the multi-account AI coding infrastructure, covering local and remote tools, configurations, and troubleshooting procedures.
+codex-rotate credentials can be shared with other AI coding tools that use OpenAI authentication. This guide covers how to set up a multi-tool infrastructure using codex-rotate as your central account manager.
 
-## Tool 1: codex-rotate (Local Machine)
+## Architecture Overview
 
-The multi-account manager for Codex CLI handles automated credential rotation on the local workstation.
+```
+Local Machine                          Remote Server (optional)
++-------------------+                  +-------------------+
+| codex-rotate      |  copy tokens     | Hermes Agent      |
+| (account manager) | ---------------> | (Chat Completions)|
+|                   |                  +-------------------+
+| ~/.codex-accounts |  copy tokens     +-------------------+
+| ~/.codex/auth.json| ---------------> | OpenClaw          |
++-------------------+                  | (Responses API)   |
+                                       +-------------------+
+```
 
-*   **Version:** 1.3.0 (published on npm)
-*   **Installation:** `npm install -g codex-rotate`
-*   **Configuration Directory:** `~/.codex-accounts/`
-*   **Credentials Storage:** `~/.codex-accounts/credentials/*.json`
-*   **Authentication Symlink:** `~/.codex/auth.json` (managed and rotated by codex-rotate)
-*   **Background Management:** Use `codex-rotate daemon start` for automated rotation.
+## Tool 1: codex-rotate (Local)
 
-### Managed Accounts
-*   **seragithub27@gmail.com (main):** Team plan, active.
-*   **seragithub19@gmail.com (account3):** Team plan, active.
+The central account manager. All other tools receive credentials from here.
 
-### Core Commands
-*   `add`: Register a new account.
-*   `list`: View all registered accounts.
-*   `status`: Check current active account and rotation state.
-*   `quota`: View remaining usage for accounts.
-*   `email`: Display email addresses and plan types from account tokens.
-*   `run`: Execute a command using a specific account.
-*   `auto`: Toggle automatic rotation logic.
-*   `daemon`: Manage the background rotation process.
-*   `doctor`: Run diagnostic checks on the environment.
-*   `tui`: Launch the interactive terminal UI.
-*   `refresh`: Update tokens for accounts.
+- **Installation:** `npm install -g codex-rotate`
+- **Config directory:** `~/.codex-accounts/`
+- **Credentials:** `~/.codex-accounts/credentials/<alias>.json`
+- **Auth symlink:** `~/.codex/auth.json` (managed by codex-rotate)
+- **Background daemon:** `codex-rotate daemon start`
 
-## Tool 2: Hermes Agent (Remote Droplet)
+### Key Commands
 
-AI agent running on a DigitalOcean droplet for persistent background tasks.
+| Command | Purpose |
+|---------|---------|
+| `codex-rotate add <alias>` | Add a new account via browser login |
+| `codex-rotate list` | Show all accounts with status |
+| `codex-rotate quota` | Check usage against rate limits |
+| `codex-rotate email` | Display account emails and plans |
+| `codex-rotate refresh --all` | Refresh all access tokens |
+| `codex-rotate daemon start` | Start background auto-rotation |
 
-*   **Host:** 157.230.39.218 (root@157.230.39.218)
-*   **Version:** 0.7.0
-*   **SSH Access:** Configured as `ssh droplet` using `~/.ssh/id_ed25519`.
-*   **Configuration:** `/root/.hermes/config.yaml` (utilizes round-robin and failover rotation).
-*   **Authentication Pool:** `/root/.hermes/auth.json` (contains seragithub27, seragithub19, and vascoyudha2).
-*   **Agent Logic:** `/root/.hermes/hermes-agent/run_agent.py`.
-*   **Logs:** `/root/.hermes/logs/agent.log`.
+## Tool 2: Hermes Agent (Remote)
 
-### Operational Commands
-*   `hermes status`: Check agent health and active account.
-*   `hermes gateway run --replace`: Restart the gateway and replace existing process.
+A Python-based AI agent that uses the **Chat Completions API** (`/v1/chat/completions`).
 
-### Critical Patch Information
-The `run_agent.py` script contains three specific modifications to address a bug in the Codex API where `response.completed` SSE events return an empty `output` array despite valid streaming data. The patch ensures output is collected from `response.output_item.done` events instead.
+### Setup
 
-## Tool 3: OpenClaw (Remote Droplet)
+1. Install Hermes on your remote server
+2. Copy codex-rotate credentials to Hermes auth pool:
+   ```bash
+   # On local machine, get the token
+   cat ~/.codex-accounts/credentials/<alias>.json
 
-Telegram-based AI coding assistant running on the same DigitalOcean droplet.
+   # On remote server, add to Hermes auth
+   # Edit ~/.hermes/auth.json to include the credentials
+   ```
+3. Configure rotation in `~/.hermes/config.yaml` (round-robin + failover)
 
-*   **Version:** 2026.4.5
-*   **Telegram Bot:** @VynsClaw_bot
-*   **Main Config:** `/root/.openclaw/openclaw.json` (Allowlist: "93372553", "5170950996").
-*   **Agent Auth:** `/root/.openclaw/agents/main/agent/auth-profiles.json` (seragithub27, seragithub19).
-*   **Binary Path:** `/usr/bin/openclaw` (installed via npm).
+### Commands
 
-### Service Management
-Restart the service using: `systemctl --user restart openclaw-gateway.service`.
+- `hermes status` — Check agent health
+- `hermes gateway run --replace` — Restart gateway
 
-### Network Configuration (IPv6 Workaround)
-The systemd service is modified with `--dns-result-order=ipv4first` in `ExecStart` and the environment variable `NODE_OPTIONS=--dns-result-order=ipv4first`. This prevents timeouts caused by the droplet having IPv6 enabled without a global IPv6 address.
+### Known Issue: Empty Streaming Output
 
-### Known Scopes Issue
-Existing tokens may lack the `api.responses.write` scope required by the OpenClaw Responses API. If "Missing scopes" errors occur, run `openclaw configure` interactively to re-authenticate with full permissions.
+The Codex API's `response.completed` SSE event may return `"output": []` even when streaming deltas contain text. If Hermes returns empty responses, patch the agent script to collect items from `response.output_item.done` events during streaming instead of relying on `stream.get_final_response()`.
 
-## Account Matrix
+## Tool 3: OpenClaw (Remote)
 
-| Account | Email | Plan | Status | Primary Use |
-| :--- | :--- | :--- | :--- | :--- |
-| main | seragithub27@gmail.com | team | Active | codex-rotate, Hermes, OpenClaw |
-| account3 | seragithub19@gmail.com | team | Active | codex-rotate, Hermes, OpenClaw |
-| vascoyudha2 | vascoyudha2@gmail.com | team | Active | Hermes only |
+A Telegram-based AI coding assistant that uses the **Responses API** (`/v1/responses`).
 
-## Troubleshooting
+### Setup
 
-*   **Empty Hermes Responses:** Verify that the `run_agent.py` patch for SSE event handling is still applied.
-*   **OpenClaw Telegram Failures:** Check the systemd service configuration for the IPv4-first DNS flags.
-*   **OpenClaw Scope Errors:** Re-authenticate the relevant profiles using `openclaw configure` to obtain the `api.responses.write` scope.
-*   **Token Expiration:** Run `codex-rotate refresh --all` locally. Remote tools require manual token updates if automated refresh fails.
-*   **Unstable SSH:** For remote command execution, use robust flags: `ssh -o ConnectTimeout=15 -o ServerAliveInterval=3 droplet 'command'`.
+1. Install OpenClaw: `npm install -g openclaw`
+2. Configure via: `openclaw configure`
+3. Manage as a systemd service: `systemctl --user restart openclaw-gateway.service`
+
+### Important: Token Scope Requirements
+
+OpenClaw uses the Responses API, which requires the `api.responses.write` scope. Tokens created by codex-rotate or Codex CLI may only have Chat Completions scopes. If you see "Missing scopes" errors:
+
+1. Run `openclaw configure` on the server
+2. Re-authenticate each account through the device code flow
+3. This grants the correct scopes for the Responses API
+
+codex-rotate tokens (Chat Completions scopes) work with Hermes but **not** with OpenClaw without re-authentication.
+
+### Known Issue: IPv6 Timeout on VPS
+
+If OpenClaw's Telegram connection times out on a VPS with IPv6 enabled but no global IPv6 address, force IPv4-first DNS resolution:
+
+```bash
+# In the systemd service file, add to ExecStart:
+--dns-result-order=ipv4first
+
+# And add environment variable:
+Environment=NODE_OPTIONS=--dns-result-order=ipv4first
+```
+
+## API Compatibility Matrix
+
+| Tool | API Endpoint | Required Scopes | codex-rotate tokens work? |
+|------|-------------|----------------|--------------------------|
+| Codex CLI | Chat Completions | standard | Yes (native) |
+| Hermes | `/v1/chat/completions` | standard | Yes |
+| OpenClaw | `/v1/responses` | `api.responses.write` | No (re-auth needed) |
+
+## Shared Account Pool
+
+All three tools can use the same OpenAI accounts. Use codex-rotate as the source of truth:
+
+```bash
+# View all accounts
+codex-rotate email
+
+# Check usage across accounts
+codex-rotate quota
+
+# Refresh tokens (local only — remote tools need manual update)
+codex-rotate refresh --all
+```
 
 ## Technical Reference
 
-*   **APIs Used:** Hermes utilizes the Chat Completions API (`/v1/chat/completions`). OpenClaw utilizes the Responses API (`/v1/responses`).
-*   **OAuth Endpoint:** `POST https://auth.openai.com/oauth/token` using Client ID `app_EMoamEEZ73f0CkXaXp7hrann`.
-*   **Model Compatibility:** ChatGPT-based accounts must use model `gpt-5.4`.
+- **OAuth refresh endpoint:** `POST https://auth.openai.com/oauth/token` with `grant_type=refresh_token`
+- **Model compatibility:** ChatGPT-based accounts use model `gpt-5.4`
+- **Token refresh:** Tokens can be refreshed using stored `refresh_token` values
+
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| Hermes returns empty responses | Check that the streaming output collection patch is applied |
+| OpenClaw Telegram timeout | Add IPv4-first DNS flags to systemd service |
+| OpenClaw "Missing scopes" error | Re-authenticate via `openclaw configure` |
+| Token expired | Run `codex-rotate refresh --all` locally |
+| Unstable SSH to remote | Use `ssh -o ConnectTimeout=15 -o ServerAliveInterval=3` |

@@ -10,3 +10,4 @@ node_modules/
 test/tmp/
 demo.gif
 demo.mp4
+.notes/
