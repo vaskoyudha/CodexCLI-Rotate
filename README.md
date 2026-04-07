@@ -29,6 +29,7 @@
 - [Requirements](#requirements)
 - [Uninstall](#uninstall)
 - [FAQ](#faq)
+- [Companion Tools](#companion-tools)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -61,7 +62,7 @@ $ codex-rotate run exec "Refactor the auth module to use JWT"
 
 $ codex-rotate status
 ╔═══════════════════════════════════════════════════════════════════════════════════╗
-║              Codex Account Rotation Manager v1.2.0                               ║
+║              Codex Account Rotation Manager v1.3.0                               ║
 ╠═══════════════════════════════════════════════════════════════════════════════════╣
 ║  ACCOUNT     EMAIL                STATUS     USES   PLAN   COOLDOWN   LAST USED  ║
 ║  personal    user@gmail.com       cooldown   14     plus   47m left   3 min ago   ║
@@ -356,7 +357,7 @@ Run `doctor` to verify your setup:
 
 ```bash
 $ codex-rotate doctor
-codex-rotate v1.2.0 — System Diagnostics
+codex-rotate v1.3.0 — System Diagnostics
 ──────────────────────────────────────────────────
 
   Bash version (≥ 4 required)            [✓] v5.1.16
@@ -437,10 +438,36 @@ It's designed for Codex CLI, but the auth.json symlink pattern could be adapted 
 **How many accounts can I add?**
 No hard limit. The tool uses flat files, so performance stays consistent regardless of account count.
 
+## Companion Tools
+
+codex-rotate manages accounts locally, but the same accounts can power AI agents on remote servers. Here's the full infrastructure this project supports:
+
+### Hermes Agent
+
+[Hermes](https://github.com/Lampese/codex-switcher) is a Python-based AI agent that uses the Chat Completions API. codex-rotate credentials work directly with Hermes — just copy the auth tokens to the Hermes credential pool.
+
+- Uses Chat Completions API (`/v1/chat/completions`)
+- Supports round-robin + failover rotation across multiple accounts
+- Compatible with standard codex-rotate tokens (no extra scopes needed)
+
+### OpenClaw
+
+[OpenClaw](https://www.npmjs.com/package/openclaw) is a Telegram-based AI coding assistant that uses the Responses API.
+
+- Uses Responses API (`/v1/responses`)
+- Requires `api.responses.write` scope (re-authenticate via `openclaw configure`)
+- Telegram bot interface for mobile coding assistance
+
+### Shared Account Pool
+
+All three tools can share the same OpenAI accounts. Use `codex-rotate email` to see your accounts, then configure Hermes and OpenClaw with the same credentials.
+
+See [docs/INFRASTRUCTURE.md](docs/INFRASTRUCTURE.md) for full setup notes and configuration details.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing instructions, and pull request guidelines.
 
 ## License
 
-[MIT](LICENSE) © 2025 [vaskoyudha](https://github.com/vaskoyudha)
+[MIT](LICENSE) © 2025-2026 [vaskoyudha](https://github.com/vaskoyudha)
