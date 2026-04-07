@@ -56,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile `uninstall` target now also removes shell completions
 - `.npmignore` updated to include completions, exclude Formula and demo files
 
-## [1.1.5] - 2026-04-05
+## [1.1.5] - 2026-04-04
 
 ### Fixed
 - **`refresh --all` now works** — `--all` flag is properly parsed instead of being treated as an alias name; no-arg refresh already refreshed all accounts, now `--all` does the same explicitly
@@ -67,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - BATS tests for `refresh --all`, no-arg refresh-all, and help text (85 total tests)
 
-## [1.1.4] - 2026-04-05
+## [1.1.4] - 2026-04-04
 
 ### Fixed
 - **Refresh preserves existing `id_token`** — when the OAuth refresh response omits `id_token`, the existing token is kept instead of being blanked (prevents losing email/plan/account-id claims)
@@ -77,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Regression tests for: refresh without `id_token`, malformed JWTs, missing email claim, usage 401/403 auto-refresh retry, invalid usage JSON, and full `cmd_auto` path through `flock`
 
-## [1.1.3] - 2026-04-05
+## [1.1.3] - 2026-04-04
 
 ### Fixed
 - **Smart rotation now works in `auto` mode** — `QUOTA_AWARE_ROTATION` flag was lost when `cmd_auto` spawned a subprocess via `flock`; the subprocess re-entered `load_config` which reset the flag to 0. Fixed by exporting `CODEX_ROTATE__QUOTA_AWARE=1` as an environment variable that survives the subprocess boundary.
@@ -85,13 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - BATS test proving quota-aware auto selection picks the lowest-usage account (71 total tests)
 
-## [1.1.2] - 2026-04-05
+## [1.1.2] - 2026-04-04
 
 ### Fixed
 - Sync `SCRIPT_VERSION` in binary, README demo banner, and `package.json` to match release version
 - Add BATS test asserting `help` output reports the correct version (70 total tests)
 
-## [1.1.1] - 2026-04-05
+## [1.1.1] - 2026-04-04
 
 ### Fixed
 - `refresh` command now returns non-zero exit code when any token refresh fails
@@ -106,7 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `parse_reset_epoch()` helper function for robust reset timestamp handling
 - 7 new mocked-API BATS tests covering quota display, refresh success/failure, credential file updates, help accuracy, and epoch timestamp parsing (69 total tests)
 
-## [1.1.0] - 2026-04-05
+## [1.1.0] - 2026-04-04
 
 ### Added
 - `quota` command — real-time usage/quota display from OpenAI API (5-hour + weekly windows)
